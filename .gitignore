@@ -1,0 +1,6 @@
+# Runtime state — never part of the deployed repo, lives under /home/pi/sitestream on the device
+*.log
+config.env
+schedule.json
+.manifest_hash
+.schedule_updated
