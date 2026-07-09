@@ -141,8 +141,16 @@ echo "$MANIFEST" | jq --arg videoDir "$VIDEO_DIR" '{
   manifestVersion: .manifestVersion,
   generatedAt: .generatedAt,
   schedule: [.schedule[] | {
-    videoId, filename, etag, startTime, endTime, daysOfWeek,
-    validFrom, validUntil, priority, label,
+    videoId: .videoId,
+    filename: .filename,
+    etag: .etag,
+    startTime: .startTime,
+    endTime: .endTime,
+    daysOfWeek: .daysOfWeek,
+    validFrom: .validFrom,
+    validUntil: .validUntil,
+    priority: .priority,
+    label: .label,
     localPath: ($videoDir + "/" + .videoId + ".mp4")
   }]
 }' > "$SCHEDULE_FILE"
