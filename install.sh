@@ -1,20 +1,18 @@
 #!/bin/bash
 # SiteStream Pi Client — first-time setup
 # Run this once on a fresh Raspberry Pi OS installation.
-# Usage: sudo bash install.sh <DEVICE_TOKEN> [API_URL]
+# Usage: sudo bash install.sh [API_URL]
 #
-# DEVICE_TOKEN: the JWT token shown in the SiteStream admin UI when you register a device
-# API_URL:      defaults to https://api.sitestream.app (or your self-hosted URL)
+# API_URL: defaults to https://api.sitestream.app (or your self-hosted URL)
+#
+# No device token needed here — this Pi identifies itself to the API by its
+# hardware serial number and waits to be claimed in the admin UI (Devices page,
+# "Claim Device" — enter the serial printed on this unit, pick a Zone, done).
+# sync.sh handles the check-in loop automatically via its normal 15-min cron.
 
 set -e
 
-DEVICE_TOKEN="${1:-}"
-API_URL="${2:-https://api.sitestream.app}"
-
-if [ -z "$DEVICE_TOKEN" ]; then
-  echo "Usage: sudo bash install.sh <DEVICE_TOKEN> [API_URL]"
-  exit 1
-fi
+API_URL="${1:-https://api.sitestream.app}"
 
 echo "=== SiteStream Pi Client Setup ==="
 echo "API: $API_URL"
@@ -27,9 +25,8 @@ apt-get install -y -q vlc jq curl cron
 mkdir -p /home/pi/sitestream/videos
 mkdir -p /home/pi/sitestream/logs
 
-# ── Write config ──────────────────────────────────────────────────────────────
+# ── Write config (no DEVICE_TOKEN yet — sync.sh provisions it on first run) ──
 cat > /home/pi/sitestream/config.env << EOF
-DEVICE_TOKEN=$DEVICE_TOKEN
 API_URL=$API_URL
 VIDEO_DIR=/home/pi/sitestream/videos
 LOG_FILE=/home/pi/sitestream/logs/sync.log
@@ -53,6 +50,8 @@ echo "$CRON_LINE" > "$CRON_FILE"
 chmod 644 "$CRON_FILE"
 
 # ── Autostart VLC via systemd service ─────────────────────────────────────────
+# Safe to enable even before claiming — player.sh just idles with nothing to
+# play until sync.sh has been claimed and produces a real schedule.json.
 cat > /etc/systemd/system/sitestream-player.service << 'EOF'
 [Unit]
 Description=SiteStream Video Player
@@ -72,7 +71,16 @@ EOF
 systemctl daemon-reload
 systemctl enable sitestream-player.service
 
+# ── Run an initial sync right now so the serial shows up immediately ─────────
+SERIAL=$(awk -F': ' '/^Serial/ {print $2}' /proc/cpuinfo | tr -d ' \n')
+sudo -u pi /home/pi/sitestream/sync.sh >> /home/pi/sitestream/logs/sync.log 2>&1 || true
+
 echo ""
 echo "=== Setup complete ==="
+echo "Device serial: $SERIAL"
+echo "Go to the SiteStream admin UI -> Devices -> Claim Device, enter that serial,"
+echo "and assign it to a Zone. This Pi will pick up its token within 15 minutes"
+echo "(or immediately, next time sync.sh runs)."
+echo ""
 echo "Reboot the Pi to start the player: sudo reboot"
 echo "Logs: tail -f /home/pi/sitestream/logs/sync.log"

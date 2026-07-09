@@ -3,6 +3,9 @@
 # Runs every 15 minutes via cron.
 #
 # What it does:
+#   0. If not yet provisioned (no DEVICE_TOKEN), checks in with the API using
+#      this Pi's hardware serial and either gets a token back (continues below)
+#      or logs that it's still waiting to be claimed and exits until next run.
 #   1. Fetches the manifest (schedule + video list) from the API
 #   2. Downloads any videos not yet cached locally (compares ETags)
 #   3. Deletes videos that are no longer in the schedule (frees SD card space)
@@ -21,6 +24,47 @@ MANIFEST_HASH_FILE="/home/pi/sitestream/.manifest_hash"
 LOG_PREFIX="[$(date '+%Y-%m-%d %H:%M:%S')]"
 
 log() { echo "$LOG_PREFIX $1"; }
+
+# ── 0. Zero-touch provisioning ─────────────────────────────────────────────────
+# No token baked in at install time — the Pi identifies itself by hardware
+# serial and waits for a Tenant Admin (or Super Admin) to claim it in the
+# admin UI. Nothing to copy onto the device by hand.
+if [ -z "$DEVICE_TOKEN" ]; then
+  SERIAL=$(awk -F': ' '/^Serial/ {print $2}' /proc/cpuinfo | tr -d ' \n')
+
+  if [ -z "$SERIAL" ]; then
+    log "ERROR: could not read hardware serial from /proc/cpuinfo. Cannot provision."
+    exit 0
+  fi
+
+  log "Not yet provisioned (serial: $SERIAL). Checking claim status…"
+
+  CHECKIN_RESPONSE=$(curl -sf \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -d "{\"serialNumber\":\"$SERIAL\"}" \
+    --max-time 15 \
+    "$API_URL/api/devices/checkin") || {
+    log "Checkin failed (API unreachable). Will retry next run."
+    exit 0
+  }
+
+  CLAIMED=$(echo "$CHECKIN_RESPONSE" | jq -r '.claimed')
+
+  if [ "$CLAIMED" != "true" ]; then
+    log "Still waiting to be claimed. Serial: $SERIAL"
+    exit 0
+  fi
+
+  DEVICE_TOKEN=$(echo "$CHECKIN_RESPONSE" | jq -r '.token')
+  log "Claimed! Saving device token and continuing with this sync."
+
+  # Preserve any other config values already in the file; just set DEVICE_TOKEN.
+  grep -v '^DEVICE_TOKEN=' "$CONFIG" 2>/dev/null > "$CONFIG.tmp" || true
+  echo "DEVICE_TOKEN=$DEVICE_TOKEN" >> "$CONFIG.tmp"
+  mv "$CONFIG.tmp" "$CONFIG"
+  chmod 600 "$CONFIG"
+fi
 
 # ── 1. Fetch manifest ─────────────────────────────────────────────────────────
 log "Fetching manifest from $API_URL/api/manifest"
