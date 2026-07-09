@@ -106,18 +106,33 @@ while IFS= read -r entry; do
   else
     log "Downloading $FILENAME ($VIDEO_ID)…"
     TEMP_PATH="$LOCAL_PATH.tmp"
+    TEMP_ETAG_FILE="$TEMP_PATH.etag"
 
+    # Discard any partial download left over from a different version of this
+    # video — resuming stale bytes onto a new ETag's content would corrupt it.
+    if [ -f "$TEMP_PATH" ] && [ "$(cat "$TEMP_ETAG_FILE" 2>/dev/null)" != "$ETAG" ]; then
+      rm -f "$TEMP_PATH" "$TEMP_ETAG_FILE"
+    fi
+    echo "$ETAG" > "$TEMP_ETAG_FILE"
+
+    # -C - resumes a partial download; --retry-all-errors covers dropped
+    # connections mid-transfer (curl otherwise only auto-retries a narrow set
+    # of transient errors), which is what large files over Wi-Fi hit in practice.
     curl -sf \
       -o "$TEMP_PATH" \
-      --max-time 600 \
+      -C - \
+      --retry 5 \
+      --retry-delay 5 \
+      --retry-all-errors \
+      --max-time 1800 \
       --progress-bar \
       "$DOWNLOAD_URL" && {
         mv "$TEMP_PATH" "$LOCAL_PATH"
         echo "$ETAG" > "$LOCAL_ETAG_FILE"
+        rm -f "$TEMP_ETAG_FILE"
         log "Downloaded $FILENAME successfully."
       } || {
-        log "ERROR: Failed to download $FILENAME. Keeping old copy if present."
-        rm -f "$TEMP_PATH"
+        log "ERROR: Failed to download $FILENAME after retries. Keeping partial data to resume next run."
       }
   fi
 done <<< "$(echo "$MANIFEST" | jq -c '.schedule[]')"

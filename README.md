@@ -57,10 +57,24 @@ the admin system themselves.
 
 ## Updating an already-deployed Pi
 
+`install.sh` copies `sync.sh`/`player.sh` from wherever you ran it *from*
+(your git checkout) into `~/sitestream` — the actual location cron and
+systemd run from. A plain `git pull` only updates the checkout, not that
+deployed copy, so use `update.sh` instead of doing it by hand:
+
+```bash
+cd ~/sitestream-src
+sudo bash update.sh
+```
+
+This pulls the latest, copies `sync.sh`/`player.sh` into `~/sitestream`, and
+restarts `sitestream-player.service`. Equivalent by-hand version, if you'd
+rather:
+
 ```bash
 cd ~/sitestream-src
 git pull
-sudo cp sync.sh player.sh ~/sitestream/
+cp sync.sh player.sh ~/sitestream/
 sudo systemctl restart sitestream-player.service
 ```
 
