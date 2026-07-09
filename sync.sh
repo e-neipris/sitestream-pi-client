@@ -9,18 +9,19 @@
 #   1. Fetches the manifest (schedule + video list) from the API
 #   2. Downloads any videos not yet cached locally (compares ETags)
 #   3. Deletes videos that are no longer in the schedule (frees SD card space)
-#   4. Writes /home/pi/sitestream/schedule.json for the player to read
+#   4. Writes schedule.json (in this script's own directory) for the player to read
 #   5. Reports back to the API (heartbeat) with confirmed manifest hash
 
 set -e
 
-CONFIG="/home/pi/sitestream/config.env"
+SITESTREAM_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG="$SITESTREAM_DIR/config.env"
 [ -f "$CONFIG" ] && source "$CONFIG"
 
 API_URL="${API_URL:-https://api.sitestream.app}"
-VIDEO_DIR="${VIDEO_DIR:-/home/pi/sitestream/videos}"
-SCHEDULE_FILE="/home/pi/sitestream/schedule.json"
-MANIFEST_HASH_FILE="/home/pi/sitestream/.manifest_hash"
+VIDEO_DIR="${VIDEO_DIR:-$SITESTREAM_DIR/videos}"
+SCHEDULE_FILE="$SITESTREAM_DIR/schedule.json"
+MANIFEST_HASH_FILE="$SITESTREAM_DIR/.manifest_hash"
 LOG_PREFIX="[$(date '+%Y-%m-%d %H:%M:%S')]"
 
 log() { echo "$LOG_PREFIX $1"; }
@@ -136,13 +137,13 @@ for f in "$VIDEO_DIR"/*.mp4; do
 done
 
 # ── 4. Write schedule.json for the player ─────────────────────────────────────
-echo "$MANIFEST" | jq '{
+echo "$MANIFEST" | jq --arg videoDir "$VIDEO_DIR" '{
   manifestVersion: .manifestVersion,
   generatedAt: .generatedAt,
   schedule: [.schedule[] | {
     videoId, filename, etag, startTime, endTime, daysOfWeek,
     validFrom, validUntil, priority, label,
-    localPath: ("/home/pi/sitestream/videos/" + .videoId + ".mp4")
+    localPath: ($videoDir + "/" + .videoId + ".mp4")
   }]
 }' > "$SCHEDULE_FILE"
 
@@ -164,4 +165,4 @@ echo "$MANIFEST_VERSION" > "$MANIFEST_HASH_FILE"
 log "Sync complete. Manifest: $MANIFEST_VERSION"
 
 # ── 6. Signal the player to re-read the schedule ──────────────────────────────
-touch /home/pi/sitestream/.schedule_updated
+touch "$SITESTREAM_DIR/.schedule_updated"

@@ -14,37 +14,57 @@ set -e
 
 API_URL="${1:-https://api.sitestream.app}"
 
+# ── Figure out who this actually installs for ─────────────────────────────────
+# Modern Raspberry Pi OS (Bullseye+) doesn't create a default "pi" user — you
+# pick your own username during imaging. Use whoever invoked sudo, not a
+# hardcoded "pi", since that's also the account whose desktop/X session VLC
+# needs to render into.
+PI_USER="${SUDO_USER:-}"
+if [ -z "$PI_USER" ] || [ "$PI_USER" = "root" ]; then
+  echo "ERROR: could not determine which user to install for."
+  echo "Run this via sudo as your normal login user, e.g.: sudo bash install.sh"
+  exit 1
+fi
+
+PI_HOME=$(getent passwd "$PI_USER" | cut -d: -f6)
+if [ -z "$PI_HOME" ] || [ ! -d "$PI_HOME" ]; then
+  echo "ERROR: could not resolve a home directory for user '$PI_USER'."
+  exit 1
+fi
+PI_GROUP=$(id -gn "$PI_USER")
+
 echo "=== SiteStream Pi Client Setup ==="
 echo "API: $API_URL"
+echo "Installing for user: $PI_USER ($PI_HOME)"
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 apt-get update -q
 apt-get install -y -q vlc jq curl cron
 
 # ── Directory structure ───────────────────────────────────────────────────────
-mkdir -p /home/pi/sitestream/videos
-mkdir -p /home/pi/sitestream/logs
+mkdir -p "$PI_HOME/sitestream/videos"
+mkdir -p "$PI_HOME/sitestream/logs"
 
 # ── Write config (no DEVICE_TOKEN yet — sync.sh provisions it on first run) ──
-cat > /home/pi/sitestream/config.env << EOF
+cat > "$PI_HOME/sitestream/config.env" << EOF
 API_URL=$API_URL
-VIDEO_DIR=/home/pi/sitestream/videos
-LOG_FILE=/home/pi/sitestream/logs/sync.log
+VIDEO_DIR=$PI_HOME/sitestream/videos
+LOG_FILE=$PI_HOME/sitestream/logs/sync.log
 EOF
 
-chmod 600 /home/pi/sitestream/config.env
+chmod 600 "$PI_HOME/sitestream/config.env"
 
 # ── Install scripts ───────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-cp "$SCRIPT_DIR/sync.sh"   /home/pi/sitestream/sync.sh
-cp "$SCRIPT_DIR/player.sh" /home/pi/sitestream/player.sh
-chmod +x /home/pi/sitestream/sync.sh
-chmod +x /home/pi/sitestream/player.sh
-chown -R pi:pi /home/pi/sitestream
+cp "$SCRIPT_DIR/sync.sh"   "$PI_HOME/sitestream/sync.sh"
+cp "$SCRIPT_DIR/player.sh" "$PI_HOME/sitestream/player.sh"
+chmod +x "$PI_HOME/sitestream/sync.sh"
+chmod +x "$PI_HOME/sitestream/player.sh"
+chown -R "$PI_USER:$PI_GROUP" "$PI_HOME/sitestream"
 
 # ── Cron job: sync every 15 minutes ──────────────────────────────────────────
-CRON_LINE="*/15 * * * * pi /home/pi/sitestream/sync.sh >> /home/pi/sitestream/logs/sync.log 2>&1"
+CRON_LINE="*/15 * * * * $PI_USER $PI_HOME/sitestream/sync.sh >> $PI_HOME/sitestream/logs/sync.log 2>&1"
 CRON_FILE="/etc/cron.d/sitestream-sync"
 echo "$CRON_LINE" > "$CRON_FILE"
 chmod 644 "$CRON_FILE"
@@ -52,15 +72,15 @@ chmod 644 "$CRON_FILE"
 # ── Autostart VLC via systemd service ─────────────────────────────────────────
 # Safe to enable even before claiming — player.sh just idles with nothing to
 # play until sync.sh has been claimed and produces a real schedule.json.
-cat > /etc/systemd/system/sitestream-player.service << 'EOF'
+cat > /etc/systemd/system/sitestream-player.service << EOF
 [Unit]
 Description=SiteStream Video Player
 After=graphical.target
 
 [Service]
-User=pi
+User=$PI_USER
 Environment=DISPLAY=:0
-ExecStart=/home/pi/sitestream/player.sh
+ExecStart=$PI_HOME/sitestream/player.sh
 Restart=always
 RestartSec=5
 
@@ -73,7 +93,7 @@ systemctl enable sitestream-player.service
 
 # ── Run an initial sync right now so the serial shows up immediately ─────────
 SERIAL=$(awk -F': ' '/^Serial/ {print $2}' /proc/cpuinfo | tr -d ' \n')
-sudo -u pi /home/pi/sitestream/sync.sh >> /home/pi/sitestream/logs/sync.log 2>&1 || true
+sudo -u "$PI_USER" "$PI_HOME/sitestream/sync.sh" >> "$PI_HOME/sitestream/logs/sync.log" 2>&1 || true
 
 echo ""
 echo "=== Setup complete ==="
@@ -83,4 +103,4 @@ echo "and assign it to a Zone. This Pi will pick up its token within 15 minutes"
 echo "(or immediately, next time sync.sh runs)."
 echo ""
 echo "Reboot the Pi to start the player: sudo reboot"
-echo "Logs: tail -f /home/pi/sitestream/logs/sync.log"
+echo "Logs: tail -f $PI_HOME/sitestream/logs/sync.log"

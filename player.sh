@@ -8,8 +8,9 @@
 #   - If different (or VLC is not running), starts VLC with the correct file
 #   - Reads schedule.json written by sync.sh
 
-SCHEDULE_FILE="/home/pi/sitestream/schedule.json"
-VIDEO_DIR="/home/pi/sitestream/videos"
+SITESTREAM_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCHEDULE_FILE="$SITESTREAM_DIR/schedule.json"
+VIDEO_DIR="$SITESTREAM_DIR/videos"
 LOG_PREFIX="[PLAYER $(date '+%H:%M:%S')]"
 
 log() { echo "$LOG_PREFIX $1"; }
@@ -94,8 +95,8 @@ while true; do
   fi
 
   # Also re-read schedule if sync.sh flagged an update
-  if [ -f /home/pi/sitestream/.schedule_updated ]; then
-    rm -f /home/pi/sitestream/.schedule_updated
+  if [ -f "$SITESTREAM_DIR/.schedule_updated" ]; then
+    rm -f "$SITESTREAM_DIR/.schedule_updated"
     log "Schedule updated — re-evaluating."
     # Force re-evaluation next loop without waiting
   fi

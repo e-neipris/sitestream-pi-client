@@ -14,7 +14,19 @@ set -e
 PURGE_PACKAGES=false
 [ "$1" = "--purge-packages" ] && PURGE_PACKAGES=true
 
+# ── Figure out whose home directory this was installed into ──────────────────
+# Same detection install.sh uses — modern Raspberry Pi OS has no default "pi"
+# user, so this must match whoever install.sh actually ran as, not a hardcoded
+# "pi". Falls back to the deprecated /home/pi path for setups from before this
+# fix, so old installs can still be cleaned up.
+PI_USER="${SUDO_USER:-}"
+if [ -n "$PI_USER" ] && [ "$PI_USER" != "root" ]; then
+  PI_HOME=$(getent passwd "$PI_USER" | cut -d: -f6)
+fi
+PI_HOME="${PI_HOME:-/home/pi}"
+
 echo "=== SiteStream Pi Client Uninstall ==="
+echo "Target: $PI_HOME/sitestream"
 
 # ── Stop and remove the player service ────────────────────────────────────────
 if systemctl list-unit-files 2>/dev/null | grep -q '^sitestream-player.service'; then
@@ -35,8 +47,8 @@ echo "Removing cron job…"
 rm -f /etc/cron.d/sitestream-sync
 
 # ── Remove runtime directory (config, cached videos, logs, schedule state) ───
-echo "Removing /home/pi/sitestream (config, cached videos, logs)…"
-rm -rf /home/pi/sitestream
+echo "Removing $PI_HOME/sitestream (config, cached videos, logs)…"
+rm -rf "$PI_HOME/sitestream"
 
 # ── Optionally remove packages install.sh installed ───────────────────────────
 if [ "$PURGE_PACKAGES" = true ]; then
@@ -55,6 +67,6 @@ echo "Note: this only cleans up the device itself. The Device record in the"
 echo "admin UI (with its serial number / token) is untouched — remove it there"
 echo "too (Devices page -> Remove) if you don't want it claimable again as-is."
 echo ""
-echo "If you cloned the source repo to set this up (e.g. /home/pi/sitestream-src),"
+echo "If you cloned the source repo to set this up (e.g. $PI_HOME/sitestream-src),"
 echo "this script is running from inside it, so remove it yourself once this exits:"
-echo "  rm -rf /home/pi/sitestream-src"
+echo "  rm -rf $PI_HOME/sitestream-src"

@@ -23,8 +23,12 @@ is the only thing that needs to exist on the device itself, so it's deployed by
   right away.
 
 All runtime state (`config.env`, `schedule.json`, logs, downloaded videos)
-lives under `/home/pi/sitestream/` on the device — nothing sensitive is ever
-committed to this repo.
+lives under `~/sitestream/` in the home directory of whoever ran
+`install.sh` via `sudo` (Raspberry Pi OS Bullseye+ has no default `pi`
+account — you pick your own username during imaging). That same user is
+also who the systemd service runs VLC as, since it needs to match whoever's
+desktop/X session is actually active. Nothing sensitive is ever committed to
+this repo.
 
 ## Deploying to a new Pi
 
@@ -32,12 +36,15 @@ No token to copy onto the device by hand — this is zero-touch, designed for
 Pis that ship anywhere and get set up by whoever's on-site, with no access to
 the admin system themselves.
 
-1. On the Pi:
+1. On the Pi, logged in as your normal user (not root):
    ```bash
-   git clone <this-repo-url> /home/pi/sitestream-src
-   cd /home/pi/sitestream-src
+   git clone <this-repo-url> ~/sitestream-src
+   cd ~/sitestream-src
    sudo bash install.sh https://your-sitestream-api.example.com
    ```
+   `install.sh` installs into *your* home directory, detected via `sudo` — run
+   it as the account that owns the Pi's desktop session, not via `su`/root
+   directly, or it won't know who to install for.
    This prints the device's hardware serial number at the end — it's also
    readable any time via `cat /proc/cpuinfo | grep Serial`, and worth putting
    on a physical label on the unit before it ships.
@@ -51,9 +58,9 @@ the admin system themselves.
 ## Updating an already-deployed Pi
 
 ```bash
-cd /home/pi/sitestream-src
+cd ~/sitestream-src
 git pull
-sudo cp sync.sh player.sh /home/pi/sitestream/
+sudo cp sync.sh player.sh ~/sitestream/
 sudo systemctl restart sitestream-player.service
 ```
 
@@ -63,8 +70,8 @@ e.g. after changing the cron schedule or systemd unit.)
 ## Uninstalling a Pi
 
 Reverses everything `install.sh` set up — stops/removes the systemd service,
-removes the cron job, deletes `/home/pi/sitestream` (config, cached videos,
-logs, schedule state):
+removes the cron job, deletes `~/sitestream` (config, cached videos,
+logs, schedule state). Run it via `sudo` as the same user you installed as:
 
 ```bash
 sudo bash uninstall.sh
@@ -80,14 +87,14 @@ sudo bash uninstall.sh --purge-packages
 
 This only cleans up the device itself — it doesn't touch the Device record
 in the admin UI. If you don't want the device claimable again as-is, remove
-it from the Devices page too. If you cloned this repo to `/home/pi/sitestream-src`
-to run `install.sh`, delete that yourself afterward (`rm -rf /home/pi/sitestream-src`)
+it from the Devices page too. If you cloned this repo to `~/sitestream-src`
+to run `install.sh`, delete that yourself afterward (`rm -rf ~/sitestream-src`)
 — the uninstall script can't safely delete the directory it's running from.
 
 ## Debugging
 
 ```bash
-tail -f /home/pi/sitestream/logs/sync.log     # sync history
+tail -f ~/sitestream/logs/sync.log     # sync history
 sudo systemctl status sitestream-player       # is the player service alive?
-cat /home/pi/sitestream/schedule.json         # what the Pi currently thinks should play
+cat ~/sitestream/schedule.json         # what the Pi currently thinks should play
 ```
