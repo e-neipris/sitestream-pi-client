@@ -115,25 +115,32 @@ while IFS= read -r entry; do
     fi
     echo "$ETAG" > "$TEMP_ETAG_FILE"
 
-    # -C - resumes a partial download; --retry-all-errors covers dropped
-    # connections mid-transfer (curl otherwise only auto-retries a narrow set
-    # of transient errors), which is what large files over Wi-Fi hit in practice.
-    curl -sf \
-      -o "$TEMP_PATH" \
-      -C - \
-      --retry 5 \
-      --retry-delay 5 \
-      --retry-all-errors \
-      --max-time 1800 \
-      --progress-bar \
-      "$DOWNLOAD_URL" && {
-        mv "$TEMP_PATH" "$LOCAL_PATH"
-        echo "$ETAG" > "$LOCAL_ETAG_FILE"
-        rm -f "$TEMP_ETAG_FILE"
-        log "Downloaded $FILENAME successfully."
-      } || {
-        log "ERROR: Failed to download $FILENAME after retries. Keeping partial data to resume next run."
-      }
+    # -C - resumes from the partial file already on disk — but curl's own
+    # --retry does NOT reliably re-apply that resume point between its
+    # internal retry attempts within a single invocation (long-standing curl
+    # quirk), so a dropped connection mid-transfer can reset to byte 0 instead
+    # of resuming. Retrying as separate curl invocations from bash instead
+    # avoids that — each fresh invocation correctly picks up the current
+    # on-disk size.
+    DOWNLOAD_OK=false
+    for attempt in 1 2 3 4 5; do
+      curl -sf \
+        -o "$TEMP_PATH" \
+        -C - \
+        --max-time 1800 \
+        "$DOWNLOAD_URL" && { DOWNLOAD_OK=true; break; }
+      log "Download attempt $attempt for $FILENAME failed or dropped — retrying in 5s…"
+      sleep 5
+    done
+
+    if [ "$DOWNLOAD_OK" = true ]; then
+      mv "$TEMP_PATH" "$LOCAL_PATH"
+      echo "$ETAG" > "$LOCAL_ETAG_FILE"
+      rm -f "$TEMP_ETAG_FILE"
+      log "Downloaded $FILENAME successfully."
+    else
+      log "ERROR: Failed to download $FILENAME after retries. Keeping partial data to resume next run."
+    fi
   fi
 done <<< "$(echo "$MANIFEST" | jq -c '.schedule[]')"
 
