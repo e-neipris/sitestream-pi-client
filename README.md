@@ -60,6 +60,30 @@ sudo systemctl restart sitestream-player.service
 (`install.sh` is idempotent too, if you need to re-run the full setup —
 e.g. after changing the cron schedule or systemd unit.)
 
+## Uninstalling a Pi
+
+Reverses everything `install.sh` set up — stops/removes the systemd service,
+removes the cron job, deletes `/home/pi/sitestream` (config, cached videos,
+logs, schedule state):
+
+```bash
+sudo bash uninstall.sh
+```
+
+By default this leaves `vlc`/`jq`/`curl`/`cron` installed, since those are
+common Raspberry Pi OS utilities other things on the box might depend on. To
+also remove those packages:
+
+```bash
+sudo bash uninstall.sh --purge-packages
+```
+
+This only cleans up the device itself — it doesn't touch the Device record
+in the admin UI. If you don't want the device claimable again as-is, remove
+it from the Devices page too. If you cloned this repo to `/home/pi/sitestream-src`
+to run `install.sh`, delete that yourself afterward (`rm -rf /home/pi/sitestream-src`)
+— the uninstall script can't safely delete the directory it's running from.
+
 ## Debugging
 
 ```bash
