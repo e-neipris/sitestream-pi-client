@@ -91,9 +91,42 @@ EOF
 systemctl daemon-reload
 systemctl enable sitestream-player.service
 
+# ── Disable Wi-Fi power management ────────────────────────────────────────────
+# The Pi's Wi-Fi chip periodically drops into a power-save state that kills
+# sustained long-lived connections — observed cutting video downloads after
+# roughly 90-150s regardless of progress, which is fatal for large files over
+# Wi-Fi. A one-off `iw` command doesn't survive reboots (dhcpcd/NetworkManager
+# reset it when the interface comes up), so this runs on every boot instead.
+# No-op if this Pi has no wlan0 (e.g. wired Ethernet only).
+if command -v iw >/dev/null 2>&1 && iw dev wlan0 info >/dev/null 2>&1; then
+  IW_BIN="$(command -v iw)"
+  iw dev wlan0 set power_save off || true
+
+  cat > /etc/systemd/system/wifi-powersave-off.service << EOF
+[Unit]
+Description=Disable Wi-Fi power management (prevents dropped downloads)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$IW_BIN dev wlan0 set power_save off
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable wifi-powersave-off.service
+  systemctl start wifi-powersave-off.service
+fi
+
 # ── Run an initial sync right now so the serial shows up immediately ─────────
 SERIAL=$(awk -F': ' '/^Serial/ {print $2}' /proc/cpuinfo | tr -d ' \n')
-sudo -u "$PI_USER" "$PI_HOME/sitestream/sync.sh" >> "$PI_HOME/sitestream/logs/sync.log" 2>&1 || true
+# The redirect must happen INSIDE the sudo'd shell, not the outer (root) one —
+# otherwise the log file gets created/owned by root, and every subsequent
+# cron-fired run (which executes purely as $PI_USER) silently fails to append
+# to it, so sync.sh never actually runs again after this first call.
+sudo -u "$PI_USER" bash -c "'$PI_HOME/sitestream/sync.sh' >> '$PI_HOME/sitestream/logs/sync.log' 2>&1" || true
 
 echo ""
 echo "=== Setup complete ==="

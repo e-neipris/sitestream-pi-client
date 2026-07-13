@@ -42,6 +42,14 @@ systemctl reset-failed 2>/dev/null || true
 # was started by hand rather than via the service)
 pkill -f "vlc .*--fullscreen" 2>/dev/null || true
 
+# ── Remove the Wi-Fi power-save-off unit ──────────────────────────────────────
+if systemctl list-unit-files 2>/dev/null | grep -q '^wifi-powersave-off.service'; then
+  echo "Removing wifi-powersave-off.service…"
+  systemctl disable wifi-powersave-off.service 2>/dev/null || true
+fi
+rm -f /etc/systemd/system/wifi-powersave-off.service
+systemctl daemon-reload
+
 # ── Remove cron job ────────────────────────────────────────────────────────────
 echo "Removing cron job…"
 rm -f /etc/cron.d/sitestream-sync

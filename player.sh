@@ -18,6 +18,17 @@ log() { echo "$LOG_PREFIX $1"; }
 CURRENT_VIDEO_PATH=""
 VLC_PID=""
 
+# Disable screen blanking/DPMS entirely — this is a kiosk display with no
+# keyboard/mouse ever attached, so X sees "no activity" forever and blanks
+# the screen on its default timeout regardless of whether a video should be
+# playing. A schedule-free gap (or just the normal gap between windows) would
+# otherwise leave the display asleep with nothing to wake it back up.
+disable_screen_blanking() {
+  DISPLAY=:0 xset s off 2>/dev/null || true
+  DISPLAY=:0 xset s noblank 2>/dev/null || true
+  DISPLAY=:0 xset -dpms 2>/dev/null || true
+}
+
 stop_vlc() {
   if [ -n "$VLC_PID" ] && kill -0 "$VLC_PID" 2>/dev/null; then
     kill "$VLC_PID"
@@ -32,6 +43,10 @@ start_vlc() {
   local video_path="$1"
   stop_vlc
   log "Starting VLC: $video_path"
+  # Force-wake in case the display already blanked before this run — the
+  # config change above only prevents future blanking, it won't undo a
+  # display that's already asleep from before player.sh (re)started.
+  DISPLAY=:0 xset dpms force on 2>/dev/null || true
   DISPLAY=:0 vlc \
     --fullscreen \
     --loop \
@@ -72,9 +87,18 @@ get_current_video() {
 }
 
 log "SiteStream player started."
+disable_screen_blanking
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
+LOOP_COUNT=0
 while true; do
+  # Re-assert every ~10 min in case anything else (a package update, a
+  # desktop environment restart) re-enables blanking behind our backs.
+  if [ $((LOOP_COUNT % 20)) -eq 0 ]; then
+    disable_screen_blanking
+  fi
+  LOOP_COUNT=$((LOOP_COUNT + 1))
+
   WANTED=$(get_current_video)
 
   if [ -z "$WANTED" ]; then

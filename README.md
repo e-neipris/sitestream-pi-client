@@ -16,11 +16,27 @@ is the only thing that needs to exist on the device itself, so it's deployed by
   writes `schedule.json`, and reports a heartbeat back to the API.
 - `player.sh` — runs as a systemd service. Every 30s, reads `schedule.json` and
   figures out what should be playing right now (time window + day-of-week +
-  priority), and starts/switches VLC if needed.
+  priority), and starts/switches VLC if needed. Disables X11 screen
+  blanking/DPMS on startup (re-asserted every ~10 min) and force-wakes the
+  display before every VLC launch — this is a kiosk with no keyboard/mouse
+  ever attached, so X blanks the screen on its default timeout regardless of
+  whether a video should be playing, and nothing else would ever wake it
+  back up.
 - `install.sh` — one-time setup: installs `vlc`/`jq`/`curl`, writes
   `config.env` (just the API URL — no credentials yet), installs the cron job
-  and systemd service, and runs an initial sync so the Pi's serial shows up
-  right away.
+  and systemd service, disables Wi-Fi power management (see below), and runs
+  an initial sync so the Pi's serial shows up right away.
+
+Wi-Fi power management is disabled on every boot via a small systemd unit
+(`wifi-powersave-off.service`). Without this, the Pi's Wi-Fi chip periodically
+drops into a power-save state that kills sustained connections — in testing
+this cut video downloads after roughly 90-150s regardless of progress, every
+time, which is fatal for any video large enough to take that long to
+transfer. `sync.sh` also resumes partial downloads (`-C -`, retried as
+separate `curl` invocations rather than relying on `--retry`'s internal
+resume, which doesn't reliably reuse the partial file) as a safety net for
+genuine one-off drops, but disabling power-save is the real fix — resuming
+forever isn't a scaling strategy for large files.
 
 All runtime state (`config.env`, `schedule.json`, logs, downloaded videos)
 lives under `~/sitestream/` in the home directory of whoever ran
