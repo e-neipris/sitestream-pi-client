@@ -11,11 +11,13 @@
 SITESTREAM_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCHEDULE_FILE="$SITESTREAM_DIR/schedule.json"
 VIDEO_DIR="$SITESTREAM_DIR/videos"
+CONFIG="$SITESTREAM_DIR/config.env"
 LOG_PREFIX="[PLAYER $(date '+%H:%M:%S')]"
 
 log() { echo "$LOG_PREFIX $1"; }
 
 CURRENT_VIDEO_PATH=""
+CURRENT_MULTICAST_TARGET=""
 VLC_PID=""
 
 # Disable screen blanking/DPMS entirely — this is a kiosk display with no
@@ -35,6 +37,7 @@ stop_vlc() {
     wait "$VLC_PID" 2>/dev/null
     VLC_PID=""
     CURRENT_VIDEO_PATH=""
+    CURRENT_MULTICAST_TARGET=""
   fi
   pkill -f "vlc" 2>/dev/null || true
 }
@@ -47,15 +50,29 @@ start_vlc() {
   # config change above only prevents future blanking, it won't undo a
   # display that's already asleep from before player.sh (re)started.
   DISPLAY=:0 xset dpms force on 2>/dev/null || true
+
+  # Multicast output (in addition to HDMI) — one Pi per site feeding an IPTV
+  # tuner. MPEG-TS over UDP is the standard IPTV distribution format; this
+  # remuxes rather than transcodes, so it assumes the source is already an
+  # H.264 MP4 (true for everything sync.sh downloads). Revisit the mux/codec
+  # here once you have the tuner manufacturer's exact ingest spec.
+  local sout_args=()
+  if [ "$MULTICAST_ENABLED" = "true" ] && [ -n "$MULTICAST_ADDRESS" ] && [ -n "$MULTICAST_PORT" ]; then
+    log "Multicast output: udp://$MULTICAST_ADDRESS:$MULTICAST_PORT"
+    sout_args=(--sout "#duplicate{dst=display,dst=std{access=udp,mux=ts,dst=$MULTICAST_ADDRESS:$MULTICAST_PORT}}" --sout-keep)
+  fi
+
   DISPLAY=:0 vlc \
     --fullscreen \
     --loop \
     --no-video-title-show \
     --no-osd \
     --quiet \
+    "${sout_args[@]}" \
     "$video_path" &
   VLC_PID=$!
   CURRENT_VIDEO_PATH="$video_path"
+  CURRENT_MULTICAST_TARGET="$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT"
 }
 
 # Returns the local file path that should be playing right now, or empty string
@@ -99,6 +116,10 @@ while true; do
   fi
   LOOP_COUNT=$((LOOP_COUNT + 1))
 
+  # Re-read config each loop so a multicast toggle (or the token, if reissued)
+  # takes effect without needing to restart this service.
+  [ -f "$CONFIG" ] && source "$CONFIG"
+
   WANTED=$(get_current_video)
 
   if [ -z "$WANTED" ]; then
@@ -111,6 +132,11 @@ while true; do
     log "WARN: Scheduled video not found locally: $WANTED (waiting for sync)"
   elif [ "$WANTED" != "$CURRENT_VIDEO_PATH" ]; then
     log "Switching to: $WANTED"
+    start_vlc "$WANTED"
+  elif [ "$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT" != "$CURRENT_MULTICAST_TARGET" ]; then
+    # Same video, but multicast settings changed since VLC started — restart
+    # to pick up the new sout config rather than waiting for the next switch.
+    log "Multicast config changed — restarting VLC for: $WANTED"
     start_vlc "$WANTED"
   elif ! kill -0 "$VLC_PID" 2>/dev/null; then
     # VLC died unexpectedly — restart it

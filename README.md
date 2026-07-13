@@ -38,6 +38,32 @@ resume, which doesn't reliably reuse the partial file) as a safety net for
 genuine one-off drops, but disabling power-save is the real fix — resuming
 forever isn't a scaling strategy for large files.
 
+## Multicast output (in addition to HDMI)
+
+Some devices — typically one per physical site — also inject their currently
+playing video into an IPTV tuner via multicast, alongside the normal HDMI
+output. This is a **device-level setting**, not a schedule-level one:
+whatever `player.sh` is showing on HDMI at any moment is what gets multicast,
+so no schedule entry needs to know or care about it.
+
+Enable it per-device in the admin UI (Devices page → Edit → "Also output via
+multicast"), which sets a multicast address/port on that `Device` row. It
+flows through `/api/manifest` → `sync.sh` (persisted into `config.env` as
+`MULTICAST_ENABLED`/`MULTICAST_ADDRESS`/`MULTICAST_PORT`) → `player.sh`, which
+launches VLC with a duplicate output (`--sout '#duplicate{dst=display,dst=std{...}}'`)
+sending MPEG-TS over UDP to that address — the standard IPTV ingest format.
+`player.sh` re-reads `config.env` every loop and restarts VLC if the
+multicast target changed, so toggling it takes effect within ~30s without
+needing a service restart.
+
+This remuxes the existing video rather than transcoding it, assuming the
+tuner accepts whatever codec `sync.sh` downloads (H.264 MP4, in practice).
+**Not yet verified against a real tuner** — get the manufacturer's exact
+ingest spec (codec, bitrate, container) and adjust the `--sout` chain in
+`player.sh` if it needs a specific transcode profile instead of a raw remux.
+Also assumes a wired network with proper IGMP snooping configured on the
+switches — multicast over Wi-Fi is unreliable and not a supported path here.
+
 All runtime state (`config.env`, `schedule.json`, logs, downloaded videos)
 lives under `~/sitestream/` in the home directory of whoever ran
 `install.sh` via `sudo` (Raspberry Pi OS Bullseye+ has no default `pi`

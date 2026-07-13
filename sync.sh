@@ -84,6 +84,20 @@ LAST_CONFIRMED=$(cat "$MANIFEST_HASH_FILE" 2>/dev/null || echo "")
 
 log "Manifest version: $MANIFEST_VERSION"
 
+# ── 1b. Persist multicast output config for player.sh to pick up ─────────────
+MULTICAST_ENABLED=$(echo "$MANIFEST" | jq -r '.multicastEnabled // false')
+MULTICAST_ADDRESS=$(echo "$MANIFEST" | jq -r '.multicastAddress // empty')
+MULTICAST_PORT=$(echo "$MANIFEST" | jq -r '.multicastPort // empty')
+
+grep -vE '^(MULTICAST_ENABLED|MULTICAST_ADDRESS|MULTICAST_PORT)=' "$CONFIG" 2>/dev/null > "$CONFIG.tmp" || true
+{
+  echo "MULTICAST_ENABLED=$MULTICAST_ENABLED"
+  echo "MULTICAST_ADDRESS=$MULTICAST_ADDRESS"
+  echo "MULTICAST_PORT=$MULTICAST_PORT"
+} >> "$CONFIG.tmp"
+mv "$CONFIG.tmp" "$CONFIG"
+chmod 600 "$CONFIG"
+
 # ── 2. Download missing / updated videos ──────────────────────────────────────
 SCHEDULE=$(echo "$MANIFEST" | jq -c '.schedule[]')
 NEEDED_IDS=()
