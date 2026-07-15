@@ -122,7 +122,7 @@ start_vlc() {
     --http-password "$VLC_HTTP_PASSWORD" \
     --file-logging \
     --logfile "$SITESTREAM_DIR/logs/vlc.log" \
-    --verbose 1 \
+    --verbose 0 \
     "$video_path" &
   VLC_PID=$!
   CURRENT_VIDEO_PATH="$video_path"
