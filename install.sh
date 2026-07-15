@@ -8,7 +8,7 @@
 # No device token needed here — this Pi identifies itself to the API by its
 # hardware serial number and waits to be claimed in the admin UI (Devices page,
 # "Claim Device" — enter the serial printed on this unit, pick a Zone, done).
-# sync.sh handles the check-in loop automatically via its normal 15-min cron.
+# sync.sh handles the check-in loop automatically via its normal 1-min cron.
 
 set -e
 
@@ -63,8 +63,8 @@ chmod +x "$PI_HOME/sitestream/sync.sh"
 chmod +x "$PI_HOME/sitestream/player.sh"
 chown -R "$PI_USER:$PI_GROUP" "$PI_HOME/sitestream"
 
-# ── Cron job: sync every 15 minutes ──────────────────────────────────────────
-CRON_LINE="*/15 * * * * $PI_USER $PI_HOME/sitestream/sync.sh >> $PI_HOME/sitestream/logs/sync.log 2>&1"
+# ── Cron job: sync every minute (sync.sh is overlap-safe via flock) ──────────
+CRON_LINE="* * * * * $PI_USER $PI_HOME/sitestream/sync.sh >> $PI_HOME/sitestream/logs/sync.log 2>&1"
 CRON_FILE="/etc/cron.d/sitestream-sync"
 echo "$CRON_LINE" > "$CRON_FILE"
 chmod 644 "$CRON_FILE"

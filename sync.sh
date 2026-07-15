@@ -1,6 +1,6 @@
 #!/bin/bash
 # SiteStream Pi Client — Sync Script
-# Runs every 15 minutes via cron.
+# Runs every minute via cron (overlap-safe — see the flock guard below).
 #
 # What it does:
 #   0. If not yet provisioned (no DEVICE_TOKEN), checks in with the API using
@@ -41,6 +41,16 @@ curl_exit_reason() {
     *) echo "unrecognized — see curl.se/libcurl/c/libcurl-errors.html" ;;
   esac
 }
+
+# With cron firing every minute, a large in-progress download can easily still
+# be running when the next tick fires. flock -n on an fd tied to a lock file
+# makes a second invocation exit immediately instead of starting a competing
+# download into the same temp file.
+exec 200>"$SITESTREAM_DIR/.sync.lock"
+if ! flock -n 200; then
+  log "Previous sync.sh still running — skipping this run."
+  exit 0
+fi
 
 # ── 0. Zero-touch provisioning ─────────────────────────────────────────────────
 # No token baked in at install time — the Pi identifies itself by hardware
