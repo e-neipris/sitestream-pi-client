@@ -39,7 +39,7 @@ echo "Installing for user: $PI_USER ($PI_HOME)"
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 apt-get update -q
-apt-get install -y -q vlc jq curl cron
+apt-get install -y -q vlc jq curl cron logrotate
 
 # ── Directory structure ───────────────────────────────────────────────────────
 mkdir -p "$PI_HOME/sitestream/videos"
@@ -62,6 +62,29 @@ cp "$SCRIPT_DIR/player.sh" "$PI_HOME/sitestream/player.sh"
 chmod +x "$PI_HOME/sitestream/sync.sh"
 chmod +x "$PI_HOME/sitestream/player.sh"
 chown -R "$PI_USER:$PI_GROUP" "$PI_HOME/sitestream"
+
+# ── Log rotation ───────────────────────────────────────────────────────────────
+# sync.log (cron-appended, now every minute) and vlc.log (held open by VLC for
+# the life of the process) both grow unbounded otherwise. copytruncate is
+# required, not just convenient — VLC never reopens its log file, so a normal
+# rename-based rotation would leave it writing forever into a renamed (or
+# deleted) file while the real path stays empty. copytruncate truncates the
+# same inode VLC already has open instead, so it needs no cooperation from VLC
+# and playback is never interrupted. Verified in a throwaway container: a
+# process holding the file open across a forced rotation kept writing
+# successfully into the truncated file with the same inode.
+cat > /etc/logrotate.d/sitestream << EOF
+$PI_HOME/sitestream/logs/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    maxsize 20M
+}
+EOF
 
 # ── Cron job: sync every minute (sync.sh is overlap-safe via flock) ──────────
 CRON_LINE="* * * * * $PI_USER $PI_HOME/sitestream/sync.sh >> $PI_HOME/sitestream/logs/sync.log 2>&1"

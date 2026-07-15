@@ -83,7 +83,7 @@ start_multicast() {
     --intf dummy \
     --vout dummy \
     --loop \
-    --sout "std{access=udp,mux=ts,dst=$MULTICAST_ADDRESS:$MULTICAST_PORT}" \
+    --sout "#std{access=udp,mux=ts,dst=$MULTICAST_ADDRESS:$MULTICAST_PORT}" \
     --sout-keep \
     "$video_path" &
   MULTICAST_PID=$!
