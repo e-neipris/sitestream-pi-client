@@ -22,9 +22,25 @@ API_URL="${API_URL:-https://api.sitestream.app}"
 VIDEO_DIR="${VIDEO_DIR:-$SITESTREAM_DIR/videos}"
 SCHEDULE_FILE="$SITESTREAM_DIR/schedule.json"
 MANIFEST_HASH_FILE="$SITESTREAM_DIR/.manifest_hash"
-LOG_PREFIX="[$(date '+%Y-%m-%d %H:%M:%S')]"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 
-log() { echo "$LOG_PREFIX $1"; }
+# Translates a curl exit code into a human-readable reason, since -f/-s alone
+# give no indication of *why* a transfer failed (timeout vs reset vs HTTP error).
+curl_exit_reason() {
+  case "$1" in
+    6) echo "couldn't resolve host (DNS)" ;;
+    7) echo "couldn't connect to host" ;;
+    18) echo "partial file — transfer closed early" ;;
+    22) echo "HTTP error response (expired presigned URL, 403/404/5xx?)" ;;
+    23) echo "local write error (disk full?)" ;;
+    28) echo "timed out (exceeded --max-time)" ;;
+    35) echo "SSL/TLS connect error" ;;
+    52) echo "server returned empty response" ;;
+    55) echo "failed sending network data" ;;
+    56) echo "connection reset while receiving data (dropped Wi-Fi?)" ;;
+    *) echo "unrecognized — see curl.se/libcurl/c/libcurl-errors.html" ;;
+  esac
+}
 
 # ── 0. Zero-touch provisioning ─────────────────────────────────────────────────
 # No token baked in at install time — the Pi identifies itself by hardware
@@ -138,12 +154,21 @@ while IFS= read -r entry; do
     # on-disk size.
     DOWNLOAD_OK=false
     for attempt in 1 2 3 4 5; do
-      curl -sf \
+      CURL_EXIT=0
+      CURL_LOG=$(curl -sS -f \
         -o "$TEMP_PATH" \
         -C - \
         --max-time 1800 \
-        "$DOWNLOAD_URL" && { DOWNLOAD_OK=true; break; }
-      log "Download attempt $attempt for $FILENAME failed or dropped — retrying in 5s…"
+        -w 'http_code=%{http_code} bytes_this_attempt=%{size_download} elapsed=%{time_total}s avg_speed=%{speed_download}B/s' \
+        "$DOWNLOAD_URL" 2>&1) || CURL_EXIT=$?
+
+      if [ "$CURL_EXIT" -eq 0 ]; then
+        DOWNLOAD_OK=true
+        break
+      fi
+
+      ON_DISK_BYTES=$(stat -c%s "$TEMP_PATH" 2>/dev/null || echo 0)
+      log "Download attempt $attempt for $FILENAME failed (curl exit $CURL_EXIT: $(curl_exit_reason "$CURL_EXIT")) — on-disk so far: ${ON_DISK_BYTES} bytes. ${CURL_LOG//$'\n'/ } — retrying in 5s…"
       sleep 5
     done
 

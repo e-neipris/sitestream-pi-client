@@ -19,6 +19,7 @@ log() { echo "$LOG_PREFIX $1"; }
 CURRENT_VIDEO_PATH=""
 CURRENT_MULTICAST_TARGET=""
 VLC_PID=""
+MULTICAST_PID=""
 
 # Disable screen blanking/DPMS entirely — this is a kiosk display with no
 # keyboard/mouse ever attached, so X sees "no activity" forever and blanks
@@ -31,14 +32,53 @@ disable_screen_blanking() {
   DISPLAY=:0 xset -dpms 2>/dev/null || true
 }
 
+# Multicast runs as a fully separate, headless VLC process from the display
+# one below — NOT combined via `--sout '#duplicate{dst=display,...}'` in a
+# single process. That was tried first and caused periodic HDMI blanking:
+# once --sout is active, VLC forks video through one shared pipeline that has
+# to serve both a decoded-frames branch (display) and an encoded-packets
+# branch (the TS remux), and a stall at each keyframe boundary in the muxer
+# stalled the shared pipeline enough to blank the live display, even though
+# the network side absorbed it invisibly in its own buffer. Two independent
+# processes means a hiccup in one can never touch the other.
+stop_multicast() {
+  if [ -n "$MULTICAST_PID" ] && kill -0 "$MULTICAST_PID" 2>/dev/null; then
+    kill "$MULTICAST_PID"
+    wait "$MULTICAST_PID" 2>/dev/null
+  fi
+  MULTICAST_PID=""
+  CURRENT_MULTICAST_TARGET=""
+}
+
+start_multicast() {
+  local video_path="$1"
+  stop_multicast
+  if [ "$MULTICAST_ENABLED" != "true" ] || [ -z "$MULTICAST_ADDRESS" ] || [ -z "$MULTICAST_PORT" ]; then
+    return
+  fi
+  log "Starting multicast output: udp://$MULTICAST_ADDRESS:$MULTICAST_PORT"
+  # No transcode{} stanza — this remuxes the existing H.264 MP4 into MPEG-TS
+  # rather than re-encoding it, which is what sync.sh downloads today. Revisit
+  # this once you have the tuner manufacturer's exact ingest spec.
+  cvlc \
+    --intf dummy \
+    --vout dummy \
+    --loop \
+    --sout "std{access=udp,mux=ts,dst=$MULTICAST_ADDRESS:$MULTICAST_PORT}" \
+    --sout-keep \
+    "$video_path" &
+  MULTICAST_PID=$!
+  CURRENT_MULTICAST_TARGET="$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT"
+}
+
 stop_vlc() {
   if [ -n "$VLC_PID" ] && kill -0 "$VLC_PID" 2>/dev/null; then
     kill "$VLC_PID"
     wait "$VLC_PID" 2>/dev/null
-    VLC_PID=""
-    CURRENT_VIDEO_PATH=""
-    CURRENT_MULTICAST_TARGET=""
   fi
+  VLC_PID=""
+  CURRENT_VIDEO_PATH=""
+  stop_multicast
   pkill -f "vlc" 2>/dev/null || true
 }
 
@@ -51,28 +91,17 @@ start_vlc() {
   # display that's already asleep from before player.sh (re)started.
   DISPLAY=:0 xset dpms force on 2>/dev/null || true
 
-  # Multicast output (in addition to HDMI) — one Pi per site feeding an IPTV
-  # tuner. MPEG-TS over UDP is the standard IPTV distribution format; this
-  # remuxes rather than transcodes, so it assumes the source is already an
-  # H.264 MP4 (true for everything sync.sh downloads). Revisit the mux/codec
-  # here once you have the tuner manufacturer's exact ingest spec.
-  local sout_args=()
-  if [ "$MULTICAST_ENABLED" = "true" ] && [ -n "$MULTICAST_ADDRESS" ] && [ -n "$MULTICAST_PORT" ]; then
-    log "Multicast output: udp://$MULTICAST_ADDRESS:$MULTICAST_PORT"
-    sout_args=(--sout "#duplicate{dst=display,dst=std{access=udp,mux=ts,dst=$MULTICAST_ADDRESS:$MULTICAST_PORT}}" --sout-keep)
-  fi
-
   DISPLAY=:0 vlc \
     --fullscreen \
     --loop \
     --no-video-title-show \
     --no-osd \
     --quiet \
-    "${sout_args[@]}" \
     "$video_path" &
   VLC_PID=$!
   CURRENT_VIDEO_PATH="$video_path"
-  CURRENT_MULTICAST_TARGET="$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT"
+
+  start_multicast "$video_path"
 }
 
 # Returns the local file path that should be playing right now, or empty string
@@ -124,7 +153,7 @@ while true; do
 
   if [ -z "$WANTED" ]; then
     # Nothing scheduled right now
-    if [ -n "$VLC_PID" ] && kill -0 "$VLC_PID" 2>/dev/null; then
+    if { [ -n "$VLC_PID" ] && kill -0 "$VLC_PID" 2>/dev/null; } || { [ -n "$MULTICAST_PID" ] && kill -0 "$MULTICAST_PID" 2>/dev/null; }; then
       log "No video scheduled — stopping player."
       stop_vlc
     fi
@@ -133,15 +162,19 @@ while true; do
   elif [ "$WANTED" != "$CURRENT_VIDEO_PATH" ]; then
     log "Switching to: $WANTED"
     start_vlc "$WANTED"
-  elif [ "$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT" != "$CURRENT_MULTICAST_TARGET" ]; then
-    # Same video, but multicast settings changed since VLC started — restart
-    # to pick up the new sout config rather than waiting for the next switch.
-    log "Multicast config changed — restarting VLC for: $WANTED"
-    start_vlc "$WANTED"
   elif ! kill -0 "$VLC_PID" 2>/dev/null; then
-    # VLC died unexpectedly — restart it
+    # VLC died unexpectedly — restart it (and multicast alongside it)
     log "VLC not running, restarting: $WANTED"
     start_vlc "$WANTED"
+  elif [ "$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT" != "$CURRENT_MULTICAST_TARGET" ]; then
+    # Same video, same display process — only the multicast config changed
+    # (or was toggled on/off). Restarting just that process doesn't touch
+    # the live display at all.
+    log "Multicast config changed — restarting multicast output for: $WANTED"
+    start_multicast "$WANTED"
+  elif [ -n "$MULTICAST_PID" ] && ! kill -0 "$MULTICAST_PID" 2>/dev/null; then
+    log "Multicast output died, restarting: $WANTED"
+    start_multicast "$WANTED"
   fi
 
   # Also re-read schedule if sync.sh flagged an update

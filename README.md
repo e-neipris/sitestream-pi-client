@@ -49,20 +49,36 @@ so no schedule entry needs to know or care about it.
 Enable it per-device in the admin UI (Devices page → Edit → "Also output via
 multicast"), which sets a multicast address/port on that `Device` row. It
 flows through `/api/manifest` → `sync.sh` (persisted into `config.env` as
-`MULTICAST_ENABLED`/`MULTICAST_ADDRESS`/`MULTICAST_PORT`) → `player.sh`, which
-launches VLC with a duplicate output (`--sout '#duplicate{dst=display,dst=std{...}}'`)
-sending MPEG-TS over UDP to that address — the standard IPTV ingest format.
-`player.sh` re-reads `config.env` every loop and restarts VLC if the
-multicast target changed, so toggling it takes effect within ~30s without
-needing a service restart.
+`MULTICAST_ENABLED`/`MULTICAST_ADDRESS`/`MULTICAST_PORT`) → `player.sh`.
 
-This remuxes the existing video rather than transcoding it, assuming the
-tuner accepts whatever codec `sync.sh` downloads (H.264 MP4, in practice).
-**Not yet verified against a real tuner** — get the manufacturer's exact
-ingest spec (codec, bitrate, container) and adjust the `--sout` chain in
-`player.sh` if it needs a specific transcode profile instead of a raw remux.
-Also assumes a wired network with proper IGMP snooping configured on the
-switches — multicast over Wi-Fi is unreliable and not a supported path here.
+`player.sh` runs multicast as a **fully separate, headless `cvlc` process**
+from the display one (`start_multicast`/`stop_multicast`, tracked via
+`MULTICAST_PID` independently of `VLC_PID`) — not combined into one VLC
+process via `--sout '#duplicate{dst=display,...}'`. That was the first
+approach tried, and it caused periodic HDMI blanking: once `--sout` is
+active, VLC forks video through one shared pipeline that has to serve both a
+decoded-frames branch (display) and an encoded-packets branch (the TS
+remux), and a stall at each keyframe boundary in the muxer stalled the
+shared pipeline enough to blank the live display — even though the network
+side absorbed the same stall invisibly in its own buffer, which is why only
+HDMI was affected. Two fully independent processes means a hiccup in one
+can never touch the other. The upside of decoupling: toggling multicast
+on/off, or changing its address/port, only restarts the headless process —
+the live display is never touched.
+
+`player.sh` re-reads `config.env` every loop and restarts the multicast
+process (only) if the target changed, so toggling it takes effect within
+~30s without needing a service restart.
+
+The multicast process remuxes the existing video rather than transcoding it
+(no `transcode{}` stanza — just `std{access=udp,mux=ts,dst=...}`), assuming
+the tuner accepts whatever codec `sync.sh` downloads (H.264 MP4, in
+practice). **Not yet verified against a real tuner** — get the
+manufacturer's exact ingest spec (codec, bitrate, container) and add a
+`transcode{}` stanza in `start_multicast` if it needs a specific profile
+instead of a raw remux. Also assumes a wired network with proper IGMP
+snooping configured on the switches — multicast over Wi-Fi is unreliable
+and not a supported path here.
 
 All runtime state (`config.env`, `schedule.json`, logs, downloaded videos)
 lives under `~/sitestream/` in the home directory of whoever ran
