@@ -21,6 +21,25 @@ CURRENT_MULTICAST_TARGET=""
 VLC_PID=""
 MULTICAST_PID=""
 
+# VLC's local HTTP status interface — used only to poll actual playback
+# progress for the stall watchdog below. Bound to 127.0.0.1 so it's never
+# reachable off the device; the password only needs to satisfy VLC's "won't
+# start http intf without one" requirement, not guard against a real attacker.
+VLC_HTTP_PORT=8090
+VLC_HTTP_PASSWORD="sitestream"
+LAST_VLC_TIME=""
+STALL_COUNT=0
+
+# Polls VLC's HTTP status interface for current playback position (ms).
+# Empty output means VLC's http interface isn't responding (still starting,
+# or actually dead) — callers should treat that as "no data" rather than a
+# stall, since kill -0 already covers the fully-dead case separately.
+get_vlc_time() {
+  curl -s --max-time 5 -u ":$VLC_HTTP_PASSWORD" \
+    "http://127.0.0.1:$VLC_HTTP_PORT/requests/status.xml" 2>/dev/null \
+    | grep -o '<time>[0-9]*</time>' | grep -o '[0-9]*'
+}
+
 # Disable screen blanking/DPMS entirely — this is a kiosk display with no
 # keyboard/mouse ever attached, so X sees "no activity" forever and blanks
 # the screen on its default timeout regardless of whether a video should be
@@ -97,9 +116,18 @@ start_vlc() {
     --no-video-title-show \
     --no-osd \
     --quiet \
+    --extraintf http,logger \
+    --http-host 127.0.0.1 \
+    --http-port "$VLC_HTTP_PORT" \
+    --http-password "$VLC_HTTP_PASSWORD" \
+    --file-logging \
+    --logfile "$SITESTREAM_DIR/logs/vlc.log" \
+    --verbose 1 \
     "$video_path" &
   VLC_PID=$!
   CURRENT_VIDEO_PATH="$video_path"
+  LAST_VLC_TIME=""
+  STALL_COUNT=0
 
   start_multicast "$video_path"
 }
@@ -175,6 +203,27 @@ while true; do
   elif [ -n "$MULTICAST_PID" ] && ! kill -0 "$MULTICAST_PID" 2>/dev/null; then
     log "Multicast output died, restarting: $WANTED"
     start_multicast "$WANTED"
+  else
+    # Steady state — same video, VLC process alive, multicast unchanged. A
+    # frozen decoder or dead X connection still passes kill -0, so cross-check
+    # actual playback progress via VLC's HTTP interface. Two consecutive
+    # identical readings (60s of zero progress) is treated as frozen; --loop
+    # means normal playback always produces a *different* time between polls,
+    # including right after it wraps back to the start.
+    CURRENT_TIME=$(get_vlc_time)
+    if [ -n "$CURRENT_TIME" ]; then
+      if [ "$CURRENT_TIME" = "$LAST_VLC_TIME" ]; then
+        STALL_COUNT=$((STALL_COUNT + 1))
+        log "WARN: VLC playback time unchanged ($CURRENT_TIME) — stall check $STALL_COUNT/2"
+        if [ "$STALL_COUNT" -ge 2 ]; then
+          log "VLC appears frozen (no progress for 60s+) — restarting: $WANTED"
+          start_vlc "$WANTED"
+        fi
+      else
+        STALL_COUNT=0
+      fi
+      LAST_VLC_TIME="$CURRENT_TIME"
+    fi
   fi
 
   # Also re-read schedule if sync.sh flagged an update
