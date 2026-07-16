@@ -57,10 +57,12 @@ chmod 600 "$PI_HOME/sitestream/config.env"
 # ── Install scripts ───────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-cp "$SCRIPT_DIR/sync.sh"   "$PI_HOME/sitestream/sync.sh"
-cp "$SCRIPT_DIR/player.sh" "$PI_HOME/sitestream/player.sh"
+cp "$SCRIPT_DIR/sync.sh"    "$PI_HOME/sitestream/sync.sh"
+cp "$SCRIPT_DIR/player.sh"  "$PI_HOME/sitestream/player.sh"
+cp "$SCRIPT_DIR/install.sh" "$PI_HOME/sitestream/install.sh"
 chmod +x "$PI_HOME/sitestream/sync.sh"
 chmod +x "$PI_HOME/sitestream/player.sh"
+chmod +x "$PI_HOME/sitestream/install.sh"
 chown -R "$PI_USER:$PI_GROUP" "$PI_HOME/sitestream"
 
 # ── Log rotation ───────────────────────────────────────────────────────────────
@@ -113,6 +115,19 @@ EOF
 
 systemctl daemon-reload
 systemctl enable sitestream-player.service
+
+# ── Sudo grant: let sync.sh restart the player service after a self-update ───
+# sync.sh runs as $PI_USER, not root (see the cron job below), but needs to
+# restart sitestream-player.service after replacing player.sh with a pushed
+# update — otherwise the Pi keeps running the old code until its next reboot.
+# Scoped to exactly this one command via sudoers.d, not blanket sudo access.
+SYSTEMCTL_BIN="$(command -v systemctl)"
+echo "$PI_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart sitestream-player.service" > /etc/sudoers.d/sitestream
+chmod 440 /etc/sudoers.d/sitestream
+if ! visudo -c -f /etc/sudoers.d/sitestream >/dev/null 2>&1; then
+  echo "ERROR: generated sudoers rule failed validation — removing it. Self-update won't be able to restart the player service until this is fixed."
+  rm -f /etc/sudoers.d/sitestream
+fi
 
 # ── Disable Wi-Fi power management ────────────────────────────────────────────
 # The Pi's Wi-Fi chip periodically drops into a power-save state that kills

@@ -10,7 +10,11 @@
 #   2. Downloads any videos not yet cached locally (compares ETags)
 #   3. Deletes videos that are no longer in the schedule (frees SD card space)
 #   4. Writes schedule.json (in this script's own directory) for the player to read
-#   5. Reports back to the API (heartbeat) with confirmed manifest hash
+#   5. Reports back to the API (heartbeat) with confirmed manifest hash + health
+#      telemetry (player.sh's live status, CPU temp, disk, uptime)
+#   6. Signals player.sh to re-read the schedule
+#   7. Applies a pending pi-client update, if the manifest targets a release
+#      different from what's installed — see the self-update section below
 
 set -e
 
@@ -40,6 +44,42 @@ curl_exit_reason() {
     56) echo "connection reset while receiving data (dropped Wi-Fi?)" ;;
     *) echo "unrecognized — see curl.se/libcurl/c/libcurl-errors.html" ;;
   esac
+}
+
+# Downloads $1 (URL) to $2 (dest path, resumable via -C -), retrying up to 5
+# times with rich failure logging labeled with $3. Sets DOWNLOAD_OK rather
+# than returning a value — used by both the per-video download loop and the
+# pi-client self-update tarball download below.
+download_with_retries() {
+  local url="$1" dest="$2" label="$3"
+  DOWNLOAD_OK=false
+  for attempt in 1 2 3 4 5; do
+    local curl_exit=0
+    local curl_log
+    # -C - resumes from the partial file already on disk — but curl's own
+    # --retry does NOT reliably re-apply that resume point between its
+    # internal retry attempts within a single invocation (long-standing curl
+    # quirk), so a dropped connection mid-transfer can reset to byte 0 instead
+    # of resuming. Retrying as separate curl invocations from bash instead
+    # avoids that — each fresh invocation correctly picks up the current
+    # on-disk size.
+    curl_log=$(curl -sS -f \
+      -o "$dest" \
+      -C - \
+      --max-time 1800 \
+      -w 'http_code=%{http_code} bytes_this_attempt=%{size_download} elapsed=%{time_total}s avg_speed=%{speed_download}B/s' \
+      "$url" 2>&1) || curl_exit=$?
+
+    if [ "$curl_exit" -eq 0 ]; then
+      DOWNLOAD_OK=true
+      return
+    fi
+
+    local on_disk_bytes
+    on_disk_bytes=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+    log "Download attempt $attempt for $label failed (curl exit $curl_exit: $(curl_exit_reason "$curl_exit")) — on-disk so far: ${on_disk_bytes} bytes. ${curl_log//$'\n'/ } — retrying in 5s…"
+    sleep 5
+  done
 }
 
 # With cron firing every minute, a large in-progress download can easily still
@@ -155,32 +195,7 @@ while IFS= read -r entry; do
     fi
     echo "$ETAG" > "$TEMP_ETAG_FILE"
 
-    # -C - resumes from the partial file already on disk — but curl's own
-    # --retry does NOT reliably re-apply that resume point between its
-    # internal retry attempts within a single invocation (long-standing curl
-    # quirk), so a dropped connection mid-transfer can reset to byte 0 instead
-    # of resuming. Retrying as separate curl invocations from bash instead
-    # avoids that — each fresh invocation correctly picks up the current
-    # on-disk size.
-    DOWNLOAD_OK=false
-    for attempt in 1 2 3 4 5; do
-      CURL_EXIT=0
-      CURL_LOG=$(curl -sS -f \
-        -o "$TEMP_PATH" \
-        -C - \
-        --max-time 1800 \
-        -w 'http_code=%{http_code} bytes_this_attempt=%{size_download} elapsed=%{time_total}s avg_speed=%{speed_download}B/s' \
-        "$DOWNLOAD_URL" 2>&1) || CURL_EXIT=$?
-
-      if [ "$CURL_EXIT" -eq 0 ]; then
-        DOWNLOAD_OK=true
-        break
-      fi
-
-      ON_DISK_BYTES=$(stat -c%s "$TEMP_PATH" 2>/dev/null || echo 0)
-      log "Download attempt $attempt for $FILENAME failed (curl exit $CURL_EXIT: $(curl_exit_reason "$CURL_EXIT")) — on-disk so far: ${ON_DISK_BYTES} bytes. ${CURL_LOG//$'\n'/ } — retrying in 5s…"
-      sleep 5
-    done
+    download_with_retries "$DOWNLOAD_URL" "$TEMP_PATH" "$FILENAME"
 
     if [ "$DOWNLOAD_OK" = true ]; then
       mv "$TEMP_PATH" "$LOCAL_PATH"
@@ -228,14 +243,58 @@ echo "$MANIFEST" | jq --arg videoDir "$VIDEO_DIR" '{
 
 log "Schedule written to $SCHEDULE_FILE"
 
-# ── 5. Heartbeat — report confirmed manifest hash ─────────────────────────────
+# ── 5. Heartbeat — report confirmed manifest hash + health telemetry ──────────
 IP_ADDRESS=$(hostname -I | awk '{print $1}')
+INSTALLED_VERSION_FILE="$SITESTREAM_DIR/.installed_version"
+INSTALLED_VERSION=$(cat "$INSTALLED_VERSION_FILE" 2>/dev/null || echo "")
+
+# System vitals — cheap local reads, safe to gather every cycle. vcgencmd is
+# Pi-specific and absent off-device (dev/test), hence the fallback to empty.
+CPU_TEMP=$(vcgencmd measure_temp 2>/dev/null | grep -o '[0-9.]*' | head -1)
+DISK_FREE_PCT=$(df -P "$SITESTREAM_DIR" 2>/dev/null | awk 'NR==2 { gsub("%","",$5); printf "%d", 100-$5 }')
+UPTIME_SECONDS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
+
+# player.sh writes its live state here every ~30s (see write_status in
+# player.sh) — player.sh has no network access of its own by design, so
+# sync.sh is what actually reports it upstream.
+CURRENT_VIDEO=""
+LAST_VIDEO_ERROR=""
+VLC_RESTART_COUNT=""
+if [ -f "$SITESTREAM_DIR/status.json" ]; then
+  CURRENT_VIDEO=$(jq -r '.currentVideo // empty' "$SITESTREAM_DIR/status.json" 2>/dev/null)
+  LAST_VIDEO_ERROR=$(jq -r '.lastVideoError // empty' "$SITESTREAM_DIR/status.json" 2>/dev/null)
+  VLC_RESTART_COUNT=$(jq -r '.vlcRestartCount // empty' "$SITESTREAM_DIR/status.json" 2>/dev/null)
+fi
+
+# Built via jq rather than hand-interpolated into a JSON string — unlike the
+# hash/IP this replaced, lastVideoError is free-text pulled from VLC's own
+# log output and could contain quotes/backslashes that would otherwise
+# produce malformed (or truncated) JSON.
+HEARTBEAT_PAYLOAD=$(jq -n \
+  --arg confirmedManifestHash "$MANIFEST_VERSION" \
+  --arg ipAddress "$IP_ADDRESS" \
+  --arg installedVersion "$INSTALLED_VERSION" \
+  --arg currentVideoFilename "$CURRENT_VIDEO" \
+  --arg lastVideoError "$LAST_VIDEO_ERROR" \
+  --arg vlcRestartCount "$VLC_RESTART_COUNT" \
+  --arg cpuTempC "$CPU_TEMP" \
+  --arg diskFreePercent "$DISK_FREE_PCT" \
+  --arg uptimeSeconds "$UPTIME_SECONDS" \
+  '{confirmedManifestHash: $confirmedManifestHash, ipAddress: $ipAddress}
+  + (if $installedVersion == "" then {} else {installedVersion: $installedVersion} end)
+  + (if $currentVideoFilename == "" then {} else {currentVideoFilename: $currentVideoFilename} end)
+  + (if $lastVideoError == "" then {} else {lastVideoError: $lastVideoError} end)
+  + (if $vlcRestartCount == "" then {} else {vlcRestartCount: ($vlcRestartCount | tonumber)} end)
+  + (if $cpuTempC == "" then {} else {cpuTempC: ($cpuTempC | tonumber)} end)
+  + (if $diskFreePercent == "" then {} else {diskFreePercent: ($diskFreePercent | tonumber)} end)
+  + (if $uptimeSeconds == "" then {} else {uptimeSeconds: ($uptimeSeconds | tonumber)} end)
+  ')
 
 curl -sf \
   -X POST \
   -H "Authorization: Bearer $DEVICE_TOKEN" \
   -H "Content-Type: application/json" \
-  -d "{\"confirmedManifestHash\":\"$MANIFEST_VERSION\",\"ipAddress\":\"$IP_ADDRESS\"}" \
+  -d "$HEARTBEAT_PAYLOAD" \
   --max-time 15 \
   "$API_URL/api/devices/$(echo "$MANIFEST" | jq -r '.deviceId')/heartbeat" \
   > /dev/null || log "WARN: Heartbeat failed (non-fatal)"
@@ -245,3 +304,60 @@ log "Sync complete. Manifest: $MANIFEST_VERSION"
 
 # ── 6. Signal the player to re-read the schedule ──────────────────────────────
 touch "$SITESTREAM_DIR/.schedule_updated"
+
+# ── 7. Self-update — apply a pinned pi-client release, if targeted ────────────
+# Pis in the field (300+ sites) can't be reached by hand, so this is the only
+# update path. Runs last so a normal cycle's core job (schedule/video sync)
+# always completes first, even on the one cycle that also finds an update.
+#
+# Known limitation: this only replaces the three script files. It does NOT
+# re-run install.sh's system-level setup (new apt packages, new systemd
+# units, new sudoers rules) — those still need a manual install.sh re-run.
+# This mechanism is for script-logic fixes (like the ones made this session),
+# not changes that touch the Pi's system configuration.
+UPDATE_VERSION=$(echo "$MANIFEST" | jq -r '.update.version // empty')
+UPDATE_URL=$(echo "$MANIFEST" | jq -r '.update.downloadUrl // empty')
+
+if [ -n "$UPDATE_VERSION" ] && [ "$UPDATE_VERSION" != "$INSTALLED_VERSION" ]; then
+  log "Update available: '${INSTALLED_VERSION:-none}' -> '$UPDATE_VERSION'. Downloading…"
+  UPDATE_TMP_DIR=$(mktemp -d)
+  UPDATE_TARBALL="$UPDATE_TMP_DIR/release.tar.gz"
+
+  download_with_retries "$UPDATE_URL" "$UPDATE_TARBALL" "pi-client update $UPDATE_VERSION"
+
+  if [ "$DOWNLOAD_OK" = true ] && tar -xzf "$UPDATE_TARBALL" -C "$UPDATE_TMP_DIR" 2>>"$SITESTREAM_DIR/logs/sync.log"; then
+    APPLY_OK=true
+    for f in sync.sh player.sh install.sh; do
+      if [ ! -f "$UPDATE_TMP_DIR/$f" ]; then
+        log "ERROR: update tarball for $UPDATE_VERSION is missing $f — aborting update, staying on '${INSTALLED_VERSION:-none}'."
+        APPLY_OK=false
+        break
+      fi
+    done
+
+    if [ "$APPLY_OK" = true ]; then
+      chmod +x "$UPDATE_TMP_DIR/sync.sh" "$UPDATE_TMP_DIR/player.sh" "$UPDATE_TMP_DIR/install.sh"
+      # mv (rename), not copy-in-place — this process keeps its already-open
+      # fd on the old sync.sh inode via the still-running interpreter, so
+      # replacing the filename out from under it is safe. The one rule is
+      # not to try to re-exec/source the new file from this same process —
+      # we just exit right after, and cron's next tick starts fresh from it.
+      mv "$UPDATE_TMP_DIR/sync.sh" "$SITESTREAM_DIR/sync.sh"
+      mv "$UPDATE_TMP_DIR/player.sh" "$SITESTREAM_DIR/player.sh"
+      mv "$UPDATE_TMP_DIR/install.sh" "$SITESTREAM_DIR/install.sh"
+      echo "$UPDATE_VERSION" > "$INSTALLED_VERSION_FILE"
+
+      log "Updated to $UPDATE_VERSION. Restarting player service."
+      sudo systemctl restart sitestream-player.service 2>>"$SITESTREAM_DIR/logs/sync.log" \
+        || log "WARN: could not restart sitestream-player.service (sudoers rule missing? see install.sh)"
+
+      rm -rf "$UPDATE_TMP_DIR"
+      log "Update to $UPDATE_VERSION complete. Exiting — next cron tick runs the new sync.sh."
+      exit 0
+    fi
+  else
+    log "ERROR: update $UPDATE_VERSION failed to download or extract — staying on '${INSTALLED_VERSION:-none}'."
+  fi
+
+  rm -rf "$UPDATE_TMP_DIR"
+fi

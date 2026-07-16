@@ -20,6 +20,40 @@ CURRENT_VIDEO_PATH=""
 CURRENT_MULTICAST_TARGET=""
 VLC_PID=""
 MULTICAST_PID=""
+STATUS_FILE="$SITESTREAM_DIR/status.json"
+# Counts only *unexpected* restarts (death/freeze recovery) — not normal
+# schedule-driven video switches. A rising count signals real instability;
+# reported to the API via sync.sh's heartbeat so it shows up in the admin UI.
+VLC_RESTART_COUNT=0
+
+# Most recent ERROR-level line from vlc.log, if any — cheap enough to tail
+# every loop tick given vlc.log is capped by logrotate.
+get_last_vlc_error() {
+  [ -f "$SITESTREAM_DIR/logs/vlc.log" ] || return
+  tail -n 50 "$SITESTREAM_DIR/logs/vlc.log" 2>/dev/null | grep -i 'error:' | tail -1
+}
+
+# Written every loop tick so sync.sh can fold live playback state into its
+# heartbeat — player.sh has no network access of its own by design (keeps it
+# focused on local playback; sync.sh already owns all API communication).
+write_status() {
+  local current_video=""
+  [ -n "$CURRENT_VIDEO_PATH" ] && current_video=$(basename "$CURRENT_VIDEO_PATH")
+  local last_error
+  last_error=$(get_last_vlc_error)
+
+  jq -n \
+    --arg currentVideo "$current_video" \
+    --arg lastVideoError "$last_error" \
+    --argjson vlcRestartCount "$VLC_RESTART_COUNT" \
+    --arg updatedAt "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    '{
+      currentVideo: (if $currentVideo == "" then null else $currentVideo end),
+      lastVideoError: (if $lastVideoError == "" then null else $lastVideoError end),
+      vlcRestartCount: $vlcRestartCount,
+      updatedAt: $updatedAt
+    }' > "$STATUS_FILE.tmp" && mv "$STATUS_FILE.tmp" "$STATUS_FILE"
+}
 
 # VLC's local HTTP status interface — used only to poll actual playback
 # progress for the stall watchdog below. Bound to 127.0.0.1 so it's never
@@ -192,6 +226,7 @@ while true; do
     start_vlc "$WANTED"
   elif ! kill -0 "$VLC_PID" 2>/dev/null; then
     # VLC died unexpectedly — restart it (and multicast alongside it)
+    VLC_RESTART_COUNT=$((VLC_RESTART_COUNT + 1))
     log "VLC not running, restarting: $WANTED"
     start_vlc "$WANTED"
   elif [ "$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT" != "$CURRENT_MULTICAST_TARGET" ]; then
@@ -216,6 +251,7 @@ while true; do
         STALL_COUNT=$((STALL_COUNT + 1))
         log "WARN: VLC playback time unchanged ($CURRENT_TIME) — stall check $STALL_COUNT/2"
         if [ "$STALL_COUNT" -ge 2 ]; then
+          VLC_RESTART_COUNT=$((VLC_RESTART_COUNT + 1))
           log "VLC appears frozen (no progress for 60s+) — restarting: $WANTED"
           start_vlc "$WANTED"
         fi
@@ -232,6 +268,8 @@ while true; do
     log "Schedule updated — re-evaluating."
     # Force re-evaluation next loop without waiting
   fi
+
+  write_status
 
   sleep 30
 done
