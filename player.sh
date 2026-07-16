@@ -113,12 +113,28 @@ start_multicast() {
   # No transcode{} stanza — this remuxes the existing H.264 MP4 into MPEG-TS
   # rather than re-encoding it, which is what sync.sh downloads today. Revisit
   # this once you have the tuner manufacturer's exact ingest spec.
+  #
+  # --aout alsa: VLC opens a local audio output for the input's audio track
+  # even on a pure remux with no display branch — confirmed by testing, not
+  # assumed. Left at its default (PulseAudio auto-probe), that open fails in
+  # this context (a systemd system service has no desktop session for
+  # PulseAudio's socket), the same failure seen on the display process.
+  # ALSA talks to the kernel sound driver directly and doesn't need one.
+  # Logging added here for the first time (this process previously had none)
+  # specifically so an audio failure on the path that actually matters — the
+  # multicast stream a hospitality TV system ingests — is visible instead of
+  # silent.
   cvlc \
     --intf dummy \
     --vout dummy \
+    --aout alsa \
     --loop \
     --sout "#std{access=udp,mux=ts,dst=$MULTICAST_ADDRESS:$MULTICAST_PORT}" \
     --sout-keep \
+    --extraintf logger \
+    --file-logging \
+    --logfile "$SITESTREAM_DIR/logs/vlc-multicast.log" \
+    --verbose 1 \
     "$video_path" &
   MULTICAST_PID=$!
   CURRENT_MULTICAST_TARGET="$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT"
@@ -144,12 +160,32 @@ start_vlc() {
   # display that's already asleep from before player.sh (re)started.
   DISPLAY=:0 xset dpms force on 2>/dev/null || true
 
+  # --aout alsa: without this, VLC auto-probes and lands on PulseAudio, which
+  # fails here ("PulseAudio server connection failure: Connection refused")
+  # since this runs as a systemd system service with no desktop session for
+  # PulseAudio's socket. ALSA talks to the kernel sound driver directly and
+  # doesn't need one. Audio over HDMI is required even though nothing local
+  # is listening — this feeds a hospitality TV system, not a room speaker.
+  # --intf dummy: this was never set before, which meant VLC loaded its full
+  # default interface (Qt on Raspberry Pi OS Desktop) despite --fullscreen/
+  # --no-osd already hiding its chrome — the Qt event loop and its QTimers
+  # were still live in the background. On a `systemctl restart` (e.g. after
+  # a pushed update), systemd's default KillMode sends SIGTERM to this
+  # process abruptly; tearing down Qt's timers from outside their owning
+  # thread during that abrupt shutdown is exactly what produced
+  # "QObject::~QObject: Timers cannot be stopped from another thread" in
+  # journalctl and made restarts slow. --extraintf (http status server,
+  # logger) are additional interfaces layered on top and are unaffected —
+  # confirmed locally that the HTTP status interface still comes up fine
+  # with --intf dummy set.
   DISPLAY=:0 vlc \
+    --intf dummy \
     --fullscreen \
     --loop \
     --no-video-title-show \
     --no-osd \
     --quiet \
+    --aout alsa \
     --extraintf http,logger \
     --http-host 127.0.0.1 \
     --http-port "$VLC_HTTP_PORT" \
@@ -196,6 +232,16 @@ get_current_video() {
 
 log "SiteStream player started."
 disable_screen_blanking
+
+# Graceful shutdown on `systemctl stop`/`restart` — paired with KillMode=process
+# in the systemd unit (systemd then only signals this process directly, not
+# every process in its cgroup) so shutdown goes through our own stop_vlc
+# (which also stops multicast) in order, instead of systemd blasting SIGTERM
+# at player.sh and VLC simultaneously and uncoordinated. Without this, a
+# restart (e.g. after a pushed self-update) killed VLC abruptly mid-Qt-event-
+# loop, which produced "QObject::~QObject: Timers cannot be stopped from
+# another thread" in journalctl and made restarts slow.
+trap 'log "Shutting down…"; stop_vlc; exit 0' TERM INT
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 LOOP_COUNT=0

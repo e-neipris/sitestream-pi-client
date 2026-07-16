@@ -88,11 +88,21 @@ $PI_HOME/sitestream/logs/*.log {
 }
 EOF
 
-# ── Cron job: sync every minute (sync.sh is overlap-safe via flock) ──────────
-CRON_LINE="* * * * * $PI_USER $PI_HOME/sitestream/sync.sh >> $PI_HOME/sitestream/logs/sync.log 2>&1"
-CRON_FILE="/etc/cron.d/sitestream-sync"
-echo "$CRON_LINE" > "$CRON_FILE"
-chmod 644 "$CRON_FILE"
+# ── Cron job: sync.sh polls the manifest on a schedule (sync.sh is overlap-
+# safe via flock). Starts at 1 minute so zero-touch claiming stays snappy —
+# a not-yet-claimed device has no zone yet, so there's nothing to configure
+# an interval from. Once claimed, sync.sh transitions itself to whatever
+# interval the zone specifies (Zone Configuration tab, default 15 min).
+#
+# Uses $PI_USER's own crontab, not /etc/cron.d/. sync.sh runs unprivileged as
+# $PI_USER and needs to be able to rewrite this itself when the configured
+# interval changes — a user's own crontab entries can only ever run as that
+# user, whereas /etc/cron.d/ entries carry their own user field per line, so
+# granting an unprivileged process write access there would be a straight
+# path to root if sync.sh were ever compromised.
+rm -f /etc/cron.d/sitestream-sync  # clean up the old mechanism, in case install.sh is being re-run
+CRON_LINE="* * * * * $PI_HOME/sitestream/sync.sh >> $PI_HOME/sitestream/logs/sync.log 2>&1"
+(crontab -u "$PI_USER" -l 2>/dev/null | grep -v "sitestream/sync.sh"; echo "$CRON_LINE") | crontab -u "$PI_USER" -
 
 # ── Autostart VLC via systemd service ─────────────────────────────────────────
 # Safe to enable even before claiming — player.sh just idles with nothing to
@@ -108,6 +118,16 @@ Environment=DISPLAY=:0
 ExecStart=$PI_HOME/sitestream/player.sh
 Restart=always
 RestartSec=5
+# Default KillMode (control-group) sends SIGTERM to player.sh AND its child
+# VLC process(es) simultaneously on every stop/restart — uncoordinated with
+# player.sh's own trap-driven stop_vlc/stop_multicast sequence, and the
+# direct hit to VLC's Qt event loop is what caused slow restarts and the
+# "QObject::~QObject: Timers cannot be stopped from another thread" warning
+# after a pushed self-update. KillMode=process signals only this process;
+# player.sh's trap handles stopping VLC/multicast itself, in order.
+KillMode=process
+# Also a safety net independent of the above: default is 90s before SIGKILL.
+TimeoutStopSec=15
 
 [Install]
 WantedBy=graphical.target
@@ -116,16 +136,20 @@ EOF
 systemctl daemon-reload
 systemctl enable sitestream-player.service
 
-# ── Sudo grant: let sync.sh restart the player service after a self-update ───
-# sync.sh runs as $PI_USER, not root (see the cron job below), but needs to
-# restart sitestream-player.service after replacing player.sh with a pushed
-# update — otherwise the Pi keeps running the old code until its next reboot.
-# Scoped to exactly this one command via sudoers.d, not blanket sudo access.
+# ── Sudo grants: let sync.sh restart the player service after a self-update,
+# and reboot the device on admin request — both scoped to exactly that one
+# command each via sudoers.d, not blanket sudo access. sync.sh runs as
+# $PI_USER, not root (see the cron job below), so without this it can't do
+# either: the Pi would keep running old code until its next natural reboot,
+# and the admin-panel Reboot button would have no way to actually reboot it.
 SYSTEMCTL_BIN="$(command -v systemctl)"
-echo "$PI_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart sitestream-player.service" > /etc/sudoers.d/sitestream
+cat > /etc/sudoers.d/sitestream << EOF
+$PI_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart sitestream-player.service
+$PI_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reboot
+EOF
 chmod 440 /etc/sudoers.d/sitestream
 if ! visudo -c -f /etc/sudoers.d/sitestream >/dev/null 2>&1; then
-  echo "ERROR: generated sudoers rule failed validation — removing it. Self-update won't be able to restart the player service until this is fixed."
+  echo "ERROR: generated sudoers rules failed validation — removing them. Self-update and the admin-panel Reboot button won't work until this is fixed."
   rm -f /etc/sudoers.d/sitestream
 fi
 
