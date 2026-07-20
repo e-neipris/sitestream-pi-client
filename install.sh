@@ -59,9 +59,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 cp "$SCRIPT_DIR/sync.sh"    "$PI_HOME/sitestream/sync.sh"
 cp "$SCRIPT_DIR/player.sh"  "$PI_HOME/sitestream/player.sh"
+cp "$SCRIPT_DIR/listen.sh"  "$PI_HOME/sitestream/listen.sh"
 cp "$SCRIPT_DIR/install.sh" "$PI_HOME/sitestream/install.sh"
 chmod +x "$PI_HOME/sitestream/sync.sh"
 chmod +x "$PI_HOME/sitestream/player.sh"
+chmod +x "$PI_HOME/sitestream/listen.sh"
 chmod +x "$PI_HOME/sitestream/install.sh"
 chown -R "$PI_USER:$PI_GROUP" "$PI_HOME/sitestream"
 
@@ -136,15 +138,45 @@ EOF
 systemctl daemon-reload
 systemctl enable sitestream-player.service
 
-# ── Sudo grants: let sync.sh restart the player service after a self-update,
-# and reboot the device on admin request — both scoped to exactly that one
-# command each via sudoers.d, not blanket sudo access. sync.sh runs as
+# ── Realtime push listener via systemd service ────────────────────────────────
+# Holds an SSE connection open to the API so schedule/firmware/reboot/zone
+# changes reach this device within seconds instead of waiting for sync.sh's
+# next cron tick — see listen.sh for the full design. Runs unprivileged as
+# $PI_USER (same as the cron job), needs no sudo grants of its own: it only
+# ever invokes sync.sh directly, which already has whatever privileges it
+# needs. Safe to enable even before claiming — it just waits for a
+# DEVICE_TOKEN to show up in config.env.
+cat > /etc/systemd/system/sitestream-listen.service << EOF
+[Unit]
+Description=SiteStream Realtime Push Listener
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$PI_USER
+ExecStart=$PI_HOME/sitestream/listen.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable sitestream-listen.service
+systemctl start sitestream-listen.service
+
+# ── Sudo grants: let sync.sh restart the player/listener services after a
+# self-update, and reboot the device on admin request — each scoped to
+# exactly one command via sudoers.d, not blanket sudo access. sync.sh runs as
 # $PI_USER, not root (see the cron job below), so without this it can't do
-# either: the Pi would keep running old code until its next natural reboot,
-# and the admin-panel Reboot button would have no way to actually reboot it.
+# any of them: the Pi would keep running old code until its next natural
+# reboot, and the admin-panel Reboot button would have no way to actually
+# reboot it.
 SYSTEMCTL_BIN="$(command -v systemctl)"
 cat > /etc/sudoers.d/sitestream << EOF
 $PI_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart sitestream-player.service
+$PI_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart sitestream-listen.service
 $PI_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN reboot
 EOF
 chmod 440 /etc/sudoers.d/sitestream

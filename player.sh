@@ -25,6 +25,17 @@ STATUS_FILE="$SITESTREAM_DIR/status.json"
 # schedule-driven video switches. A rising count signals real instability;
 # reported to the API via sync.sh's heartbeat so it shows up in the admin UI.
 VLC_RESTART_COUNT=0
+HEALTH_URGENT_FILE="$SITESTREAM_DIR/.health_urgent"
+
+# player.sh has no network access of its own by design (see write_status
+# below) — this breadcrumb is how an unexpected restart reaches the API
+# within seconds instead of waiting up to the zone's full sync interval.
+# listen.sh (a separate always-on process) watches for this file and, on
+# seeing it, triggers an immediate sync.sh run — which is what actually
+# reports it, same as any other heartbeat.
+signal_urgent_health() {
+  touch "$HEALTH_URGENT_FILE"
+}
 
 # Most recent ERROR-level line from vlc.log, if any — cheap enough to tail
 # every loop tick given vlc.log is capped by logrotate.
@@ -56,22 +67,49 @@ write_status() {
 }
 
 # VLC's local HTTP status interface — used only to poll actual playback
-# progress for the stall watchdog below. Bound to 127.0.0.1 so it's never
+# health for the stall watchdog below. Bound to 127.0.0.1 so it's never
 # reachable off the device; the password only needs to satisfy VLC's "won't
 # start http intf without one" requirement, not guard against a real attacker.
 VLC_HTTP_PORT=8090
 VLC_HTTP_PASSWORD="sitestream"
 LAST_VLC_TIME=""
+# Baselined at "0", not "" — displayedpictures is monotonically increasing
+# starting from 0, so "0" is a real, meaningful baseline (a stall reads as
+# genuinely equal to it) rather than a sentinel that always looks like
+# "progress" the first time a real reading comes in. By the time the first
+# steady-state poll happens (a full 30s after start_vlc), a healthy player
+# has displayed far more than 0 frames, so this never mistakes a normal
+# startup for a stall.
+LAST_DISPLAYED_PICTURES="0"
 STALL_COUNT=0
 
-# Polls VLC's HTTP status interface for current playback position (ms).
-# Empty output means VLC's http interface isn't responding (still starting,
-# or actually dead) — callers should treat that as "no data" rather than a
-# stall, since kill -0 already covers the fully-dead case separately.
-get_vlc_time() {
+# Single poll of VLC's HTTP status interface per loop tick — one curl call,
+# both fields below are pulled from the same response. Empty output means
+# the interface isn't responding at all (still starting, or actually dead).
+get_vlc_status_xml() {
   curl -s --max-time 5 -u ":$VLC_HTTP_PASSWORD" \
-    "http://127.0.0.1:$VLC_HTTP_PORT/requests/status.xml" 2>/dev/null \
-    | grep -o '<time>[0-9]*</time>' | grep -o '[0-9]*'
+    "http://127.0.0.1:$VLC_HTTP_PORT/requests/status.xml" 2>/dev/null
+}
+
+# Playback position (seconds) — kept only for the WARN log line's context now,
+# NOT for the restart decision. Confirmed via a live mmal_codec decoder
+# failure ("Pic has no attached buffer") that <time> keeps advancing normally
+# — it's driven by the audio/demux clock, not by successful video decode —
+# while the screen was fully black. A stall-detector built on this alone
+# never fires for a video-only failure like that one.
+extract_vlc_time() {
+  echo "$1" | grep -o '<time>[0-9]*</time>' | grep -o '[0-9]*'
+}
+
+# Cumulative count of frames actually handed to the display, straight from
+# VLC's own stats block (populated by default on this VLC build — no --stats
+# flag needed, confirmed against real hardware). This is the actual signal
+# that matters: whether it's advancing is a direct answer to "is video
+# reaching the screen," unlike playback time. It reset to 0 for the entire
+# duration of the mmal_codec failure that motivated this — <time> looked
+# completely healthy throughout.
+extract_vlc_displayed_pictures() {
+  echo "$1" | grep -o '<displayedpictures>[0-9]*</displayedpictures>' | grep -o '[0-9]*'
 }
 
 # Disable screen blanking/DPMS entirely — this is a kiosk display with no
@@ -106,6 +144,12 @@ stop_multicast() {
 start_multicast() {
   local video_path="$1"
   stop_multicast
+  # Record the target state immediately, even when it resolves to "disabled" —
+  # otherwise stop_multicast's reset to "" never gets superseded when the
+  # guard below returns early, and the main loop's config-changed check keeps
+  # re-triggering this function every tick forever, starving out the `else`
+  # branch (the VLC stall/freeze watchdog) below it.
+  CURRENT_MULTICAST_TARGET="$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT"
   if [ "$MULTICAST_ENABLED" != "true" ] || [ -z "$MULTICAST_ADDRESS" ] || [ -z "$MULTICAST_PORT" ]; then
     return
   fi
@@ -137,7 +181,6 @@ start_multicast() {
     --verbose 1 \
     "$video_path" &
   MULTICAST_PID=$!
-  CURRENT_MULTICAST_TARGET="$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT"
 }
 
 stop_vlc() {
@@ -197,6 +240,7 @@ start_vlc() {
   VLC_PID=$!
   CURRENT_VIDEO_PATH="$video_path"
   LAST_VLC_TIME=""
+  LAST_DISPLAYED_PICTURES="0"
   STALL_COUNT=0
 
   start_multicast "$video_path"
@@ -274,12 +318,18 @@ while true; do
     # VLC died unexpectedly — restart it (and multicast alongside it)
     VLC_RESTART_COUNT=$((VLC_RESTART_COUNT + 1))
     log "VLC not running, restarting: $WANTED"
+    signal_urgent_health
     start_vlc "$WANTED"
   elif [ "$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT" != "$CURRENT_MULTICAST_TARGET" ]; then
     # Same video, same display process — only the multicast config changed
     # (or was toggled on/off). Restarting just that process doesn't touch
-    # the live display at all.
-    log "Multicast config changed — restarting multicast output for: $WANTED"
+    # the live display at all. Logged only when it's actually enabled —
+    # otherwise this fires every tick for a device with multicast off
+    # (nothing to report; start_multicast() no-ops) and reads as if a
+    # stream is being started when none ever is.
+    if [ "$MULTICAST_ENABLED" = "true" ] && [ -n "$MULTICAST_ADDRESS" ] && [ -n "$MULTICAST_PORT" ]; then
+      log "Multicast config changed — restarting multicast output for: $WANTED"
+    fi
     start_multicast "$WANTED"
   elif [ -n "$MULTICAST_PID" ] && ! kill -0 "$MULTICAST_PID" 2>/dev/null; then
     log "Multicast output died, restarting: $WANTED"
@@ -287,24 +337,48 @@ while true; do
   else
     # Steady state — same video, VLC process alive, multicast unchanged. A
     # frozen decoder or dead X connection still passes kill -0, so cross-check
-    # actual playback progress via VLC's HTTP interface. Two consecutive
-    # identical readings (60s of zero progress) is treated as frozen; --loop
-    # means normal playback always produces a *different* time between polls,
-    # including right after it wraps back to the start.
-    CURRENT_TIME=$(get_vlc_time)
-    if [ -n "$CURRENT_TIME" ]; then
-      if [ "$CURRENT_TIME" = "$LAST_VLC_TIME" ]; then
-        STALL_COUNT=$((STALL_COUNT + 1))
-        log "WARN: VLC playback time unchanged ($CURRENT_TIME) — stall check $STALL_COUNT/2"
-        if [ "$STALL_COUNT" -ge 2 ]; then
-          VLC_RESTART_COUNT=$((VLC_RESTART_COUNT + 1))
-          log "VLC appears frozen (no progress for 60s+) — restarting: $WANTED"
-          start_vlc "$WANTED"
-        fi
+    # actual playback health via VLC's HTTP interface.
+    #
+    # The health signal is displayedpictures (frames actually handed to the
+    # display), NOT playback time — confirmed against a real mmal_codec
+    # decoder failure ("Pic has no attached buffer") that left the screen
+    # fully black for 5+ minutes with zero restarts: <time> climbed normally
+    # the entire time (it tracks the audio/demux clock, which kept running
+    # fine) while <displayedpictures> sat frozen at 0 and <lostpictures>
+    # climbed instead. A watchdog built on time alone is structurally blind
+    # to a video-only decode failure like that one — it was never going to
+    # fire no matter how long the freeze lasted.
+    #
+    # Two consecutive identical readings (60s of zero new displayed frames)
+    # is treated as frozen; a healthy player always displays more frames
+    # between 30s polls, --loop wrap included (the counter is cumulative for
+    # the process's lifetime and doesn't reset at the loop boundary).
+    STATUS_XML=$(get_vlc_status_xml)
+    CURRENT_TIME=$(extract_vlc_time "$STATUS_XML")
+    CURRENT_DISPLAYED=$(extract_vlc_displayed_pictures "$STATUS_XML")
+
+    if [ -n "$CURRENT_DISPLAYED" ] && [ "$CURRENT_DISPLAYED" != "$LAST_DISPLAYED_PICTURES" ]; then
+      # New frames actually reached the display since the last poll — healthy.
+      STALL_COUNT=0
+      LAST_DISPLAYED_PICTURES="$CURRENT_DISPLAYED"
+      [ -n "$CURRENT_TIME" ] && LAST_VLC_TIME="$CURRENT_TIME"
+    else
+      # Either the HTTP interface didn't respond at all, or displayedpictures
+      # hasn't moved since last poll — both mean "can't confirm video is
+      # actually reaching the screen," and both count toward the same
+      # restart trigger.
+      STALL_COUNT=$((STALL_COUNT + 1))
+      if [ -z "$STATUS_XML" ]; then
+        log "WARN: VLC HTTP status interface not responding — stall check $STALL_COUNT/2"
       else
-        STALL_COUNT=0
+        log "WARN: VLC displayedpictures unchanged ($CURRENT_DISPLAYED, time=$CURRENT_TIME) — stall check $STALL_COUNT/2"
       fi
-      LAST_VLC_TIME="$CURRENT_TIME"
+      if [ "$STALL_COUNT" -ge 2 ]; then
+        VLC_RESTART_COUNT=$((VLC_RESTART_COUNT + 1))
+        log "VLC appears frozen or unresponsive (60s+) — restarting: $WANTED"
+        signal_urgent_health
+        start_vlc "$WANTED"
+      fi
     fi
   fi
 

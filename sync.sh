@@ -465,7 +465,7 @@ if [ -n "$UPDATE_VERSION" ] && [ "$UPDATE_VERSION" != "$INSTALLED_VERSION" ]; th
 
   if [ "$DOWNLOAD_OK" = true ] && tar -xzf "$UPDATE_TARBALL" -C "$UPDATE_TMP_DIR" 2>>"$SITESTREAM_DIR/logs/sync.log"; then
     APPLY_OK=true
-    for f in sync.sh player.sh install.sh; do
+    for f in sync.sh player.sh install.sh listen.sh; do
       if [ ! -f "$UPDATE_TMP_DIR/$f" ]; then
         log "ERROR: update tarball for $UPDATE_VERSION is missing $f — aborting update, staying on '${INSTALLED_VERSION:-none}'."
         APPLY_OK=false
@@ -474,7 +474,7 @@ if [ -n "$UPDATE_VERSION" ] && [ "$UPDATE_VERSION" != "$INSTALLED_VERSION" ]; th
     done
 
     if [ "$APPLY_OK" = true ]; then
-      chmod +x "$UPDATE_TMP_DIR/sync.sh" "$UPDATE_TMP_DIR/player.sh" "$UPDATE_TMP_DIR/install.sh"
+      chmod +x "$UPDATE_TMP_DIR/sync.sh" "$UPDATE_TMP_DIR/player.sh" "$UPDATE_TMP_DIR/install.sh" "$UPDATE_TMP_DIR/listen.sh"
       # mv (rename), not copy-in-place — this process keeps its already-open
       # fd on the old sync.sh inode via the still-running interpreter, so
       # replacing the filename out from under it is safe. The one rule is
@@ -483,11 +483,18 @@ if [ -n "$UPDATE_VERSION" ] && [ "$UPDATE_VERSION" != "$INSTALLED_VERSION" ]; th
       mv "$UPDATE_TMP_DIR/sync.sh" "$SITESTREAM_DIR/sync.sh"
       mv "$UPDATE_TMP_DIR/player.sh" "$SITESTREAM_DIR/player.sh"
       mv "$UPDATE_TMP_DIR/install.sh" "$SITESTREAM_DIR/install.sh"
+      mv "$UPDATE_TMP_DIR/listen.sh" "$SITESTREAM_DIR/listen.sh"
       echo "$UPDATE_VERSION" > "$INSTALLED_VERSION_FILE"
 
-      log "Updated to $UPDATE_VERSION. Restarting player service."
+      log "Updated to $UPDATE_VERSION. Restarting player and listener services."
       sudo systemctl restart sitestream-player.service 2>>"$SITESTREAM_DIR/logs/sync.log" \
         || log "WARN: could not restart sitestream-player.service (sudoers rule missing? see install.sh)"
+      # Older devices updating for the first time past this release won't have
+      # this unit yet (self-update never re-runs install.sh's system-level
+      # setup — see the header note above) — that's expected, not an error;
+      # it'll exist after their next manual install.sh re-run.
+      sudo systemctl restart sitestream-listen.service 2>>"$SITESTREAM_DIR/logs/sync.log" \
+        || log "WARN: could not restart sitestream-listen.service (not installed yet? re-run install.sh)"
 
       rm -rf "$UPDATE_TMP_DIR"
       log "Update to $UPDATE_VERSION complete. Exiting — next cron tick runs the new sync.sh."
