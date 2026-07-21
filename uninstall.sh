@@ -42,6 +42,25 @@ systemctl reset-failed 2>/dev/null || true
 # was started by hand rather than via the service)
 pkill -f "vlc .*--fullscreen" 2>/dev/null || true
 
+# ── Stop and remove the realtime push listener service ────────────────────────
+if systemctl list-unit-files 2>/dev/null | grep -q '^sitestream-listen.service'; then
+  echo "Stopping sitestream-listen.service…"
+  systemctl stop sitestream-listen.service 2>/dev/null || true
+  systemctl disable sitestream-listen.service 2>/dev/null || true
+fi
+rm -f /etc/systemd/system/sitestream-listen.service
+systemctl daemon-reload
+systemctl reset-failed 2>/dev/null || true
+
+# listen.sh spawns sync.sh as a backgrounded child whenever it reacts to a
+# push (see trigger_sync() in listen.sh) — `systemctl stop` above only
+# signals the main listen.sh process (KillMode=process, same reasoning as
+# install.sh), so a sync.sh that happened to be mid-run survives that. A full
+# uninstall is a much more final action than a routine restart, so clean any
+# of those up directly rather than leaving them to finish into a directory
+# that's about to be deleted out from under them.
+pkill -f "sitestream/sync.sh" 2>/dev/null || true
+
 # ── Remove the Wi-Fi power-save-off unit ──────────────────────────────────────
 if systemctl list-unit-files 2>/dev/null | grep -q '^wifi-powersave-off.service'; then
   echo "Removing wifi-powersave-off.service…"
@@ -53,6 +72,20 @@ systemctl daemon-reload
 # ── Remove cron job ────────────────────────────────────────────────────────────
 echo "Removing cron job…"
 rm -f /etc/cron.d/sitestream-sync
+if [ -n "$PI_USER" ] && [ "$PI_USER" != "root" ]; then
+  (crontab -u "$PI_USER" -l 2>/dev/null | grep -v "sitestream/sync.sh") | crontab -u "$PI_USER" - 2>/dev/null || true
+fi
+
+# ── Remove sudoers grant ───────────────────────────────────────────────────────
+# install.sh's scoped NOPASSWD grants (restart player/listener, reboot) —
+# leaving this behind after uninstall is a stale passwordless-root grant for
+# services that no longer exist.
+echo "Removing sudoers grant…"
+rm -f /etc/sudoers.d/sitestream
+
+# ── Remove log rotation config ─────────────────────────────────────────────────
+echo "Removing logrotate config…"
+rm -f /etc/logrotate.d/sitestream
 
 # ── Remove runtime directory (config, cached videos, logs, schedule state) ───
 echo "Removing $PI_HOME/sitestream (config, cached videos, logs)…"
@@ -60,11 +93,12 @@ rm -rf "$PI_HOME/sitestream"
 
 # ── Optionally remove packages install.sh installed ───────────────────────────
 if [ "$PURGE_PACKAGES" = true ]; then
-  echo "Removing packages: vlc jq curl cron…"
-  apt-get remove -y -q vlc jq curl cron
+  echo "Removing packages: vlc jq curl cron logrotate qrencode imagemagick fonts-dejavu-core…"
+  apt-get remove -y -q vlc jq curl cron logrotate qrencode imagemagick fonts-dejavu-core
   apt-get autoremove -y -q
 else
-  echo "Leaving vlc/jq/curl/cron installed (common system utilities — pass --purge-packages to also remove them)."
+  echo "Leaving vlc/jq/curl/cron/logrotate/qrencode/imagemagick/fonts-dejavu-core installed"
+  echo "(common system utilities — pass --purge-packages to also remove them)."
 fi
 
 echo ""
