@@ -221,10 +221,17 @@ start_vlc() {
   # logger) are additional interfaces layered on top and are unaffected —
   # confirmed locally that the HTTP status interface still comes up fine
   # with --intf dummy set.
+  # --image-duration -1: only relevant when $video_path is a still image (the
+  # onboarding screen — see the unconfigured branch above), where VLC's image
+  # demuxer otherwise advances/reloads it every few seconds by default,
+  # producing a visible flash/reload loop instead of a steady display. No
+  # effect on an actual video file — that path never touches the image
+  # demuxer at all.
   DISPLAY=:0 vlc \
     --intf dummy \
     --fullscreen \
     --loop \
+    --image-duration -1 \
     --no-video-title-show \
     --no-osd \
     --quiet \
@@ -300,6 +307,27 @@ while true; do
   # Re-read config each loop so a multicast toggle (or the token, if reissued)
   # takes effect without needing to restart this service.
   [ -f "$CONFIG" ] && source "$CONFIG"
+
+  # Not yet claimed — show the onboarding screen (serial + QR code) instead
+  # of the normal schedule logic below, entirely bypassing it. Generating is
+  # idempotent/cheap (skips if it already exists — see
+  # generate-onboarding-screen.sh), so it's simplest to just call it every
+  # tick rather than tracking whether it's already been done. The moment
+  # sync.sh claims this device and writes a real DEVICE_TOKEN into
+  # config.env, the very next loop tick (re-sourced above) sees that and
+  # falls through to normal playback on its own — no separate transition
+  # logic needed.
+  if [ -z "$DEVICE_TOKEN" ]; then
+    "$SITESTREAM_DIR/generate-onboarding-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
+    ONBOARDING_IMAGE="$SITESTREAM_DIR/onboarding.png"
+    if [ -f "$ONBOARDING_IMAGE" ] && { [ "$CURRENT_VIDEO_PATH" != "$ONBOARDING_IMAGE" ] || ! kill -0 "$VLC_PID" 2>/dev/null; }; then
+      log "Not yet claimed — showing onboarding screen (serial + QR code)."
+      start_vlc "$ONBOARDING_IMAGE"
+    fi
+    write_status
+    sleep 30
+    continue
+  fi
 
   WANTED=$(get_current_video)
 

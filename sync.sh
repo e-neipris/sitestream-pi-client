@@ -482,7 +482,7 @@ if [ -n "$UPDATE_VERSION" ] && [ "$UPDATE_VERSION" != "$INSTALLED_VERSION" ]; th
 
   if [ "$DOWNLOAD_OK" = true ] && tar -xzf "$UPDATE_TARBALL" -C "$UPDATE_TMP_DIR" 2>>"$SITESTREAM_DIR/logs/sync.log"; then
     APPLY_OK=true
-    for f in sync.sh player.sh install.sh listen.sh; do
+    for f in sync.sh player.sh install.sh listen.sh generate-onboarding-screen.sh; do
       if [ ! -f "$UPDATE_TMP_DIR/$f" ]; then
         log "ERROR: update tarball for $UPDATE_VERSION is missing $f — aborting update, staying on '${INSTALLED_VERSION:-none}'."
         APPLY_OK=false
@@ -491,7 +491,7 @@ if [ -n "$UPDATE_VERSION" ] && [ "$UPDATE_VERSION" != "$INSTALLED_VERSION" ]; th
     done
 
     if [ "$APPLY_OK" = true ]; then
-      chmod +x "$UPDATE_TMP_DIR/sync.sh" "$UPDATE_TMP_DIR/player.sh" "$UPDATE_TMP_DIR/install.sh" "$UPDATE_TMP_DIR/listen.sh"
+      chmod +x "$UPDATE_TMP_DIR/sync.sh" "$UPDATE_TMP_DIR/player.sh" "$UPDATE_TMP_DIR/install.sh" "$UPDATE_TMP_DIR/listen.sh" "$UPDATE_TMP_DIR/generate-onboarding-screen.sh"
       # mv (rename), not copy-in-place — this process keeps its already-open
       # fd on the old sync.sh inode via the still-running interpreter, so
       # replacing the filename out from under it is safe. The one rule is
@@ -501,6 +501,7 @@ if [ -n "$UPDATE_VERSION" ] && [ "$UPDATE_VERSION" != "$INSTALLED_VERSION" ]; th
       mv "$UPDATE_TMP_DIR/player.sh" "$SITESTREAM_DIR/player.sh"
       mv "$UPDATE_TMP_DIR/install.sh" "$SITESTREAM_DIR/install.sh"
       mv "$UPDATE_TMP_DIR/listen.sh" "$SITESTREAM_DIR/listen.sh"
+      mv "$UPDATE_TMP_DIR/generate-onboarding-screen.sh" "$SITESTREAM_DIR/generate-onboarding-screen.sh"
       echo "$UPDATE_VERSION" > "$INSTALLED_VERSION_FILE"
 
       log "Updated to $UPDATE_VERSION. Restarting player and listener services."

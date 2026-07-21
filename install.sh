@@ -1,18 +1,25 @@
 #!/bin/bash
 # SiteStream Pi Client — first-time setup
 # Run this once on a fresh Raspberry Pi OS installation.
-# Usage: sudo bash install.sh [API_URL]
+# Usage: sudo bash install.sh [API_URL] [APP_URL]
 #
 # API_URL: defaults to https://api.sitestream.app (or your self-hosted URL)
+# APP_URL: the web portal (not the API) — same env var name/default as the
+#   API's own APP_URL (see packages/api/src/lib/mailer.ts) for consistency.
+#   Only used to build the QR code on the onboarding screen (see
+#   generate-onboarding-screen.sh) — nothing here talks to it directly.
 #
 # No device token needed here — this Pi identifies itself to the API by its
 # hardware serial number and waits to be claimed in the admin UI (Devices page,
 # "Claim Device" — enter the serial printed on this unit, pick a Zone, done).
 # sync.sh handles the check-in loop automatically via its normal 1-min cron.
+# Until claimed, player.sh shows an onboarding screen with that serial and a
+# QR code straight to the claim flow instead of a blank/idle display.
 
 set -e
 
 API_URL="${1:-https://api.sitestream.app}"
+APP_URL="${2:-https://app.sitestream.app}"
 
 # ── Figure out who this actually installs for ─────────────────────────────────
 # Modern Raspberry Pi OS (Bullseye+) doesn't create a default "pi" user — you
@@ -38,8 +45,12 @@ echo "API: $API_URL"
 echo "Installing for user: $PI_USER ($PI_HOME)"
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
+# qrencode + imagemagick + fonts-dejavu-core are only for the onboarding
+# screen (generate-onboarding-screen.sh) — everything else here is the
+# existing set. fonts-dejavu-core is explicit, not assumed pre-installed —
+# ImageMagick's -font DejaVu-Sans-Bold/DejaVu-Sans lookups need it present.
 apt-get update -q
-apt-get install -y -q vlc jq curl cron logrotate
+apt-get install -y -q vlc jq curl cron logrotate qrencode imagemagick fonts-dejavu-core
 
 # ── Directory structure ───────────────────────────────────────────────────────
 mkdir -p "$PI_HOME/sitestream/videos"
@@ -48,6 +59,7 @@ mkdir -p "$PI_HOME/sitestream/logs"
 # ── Write config (no DEVICE_TOKEN yet — sync.sh provisions it on first run) ──
 cat > "$PI_HOME/sitestream/config.env" << EOF
 API_URL=$API_URL
+APP_URL=$APP_URL
 VIDEO_DIR=$PI_HOME/sitestream/videos
 LOG_FILE=$PI_HOME/sitestream/logs/sync.log
 EOF
@@ -57,13 +69,15 @@ chmod 600 "$PI_HOME/sitestream/config.env"
 # ── Install scripts ───────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-cp "$SCRIPT_DIR/sync.sh"    "$PI_HOME/sitestream/sync.sh"
-cp "$SCRIPT_DIR/player.sh"  "$PI_HOME/sitestream/player.sh"
-cp "$SCRIPT_DIR/listen.sh"  "$PI_HOME/sitestream/listen.sh"
-cp "$SCRIPT_DIR/install.sh" "$PI_HOME/sitestream/install.sh"
+cp "$SCRIPT_DIR/sync.sh"                        "$PI_HOME/sitestream/sync.sh"
+cp "$SCRIPT_DIR/player.sh"                      "$PI_HOME/sitestream/player.sh"
+cp "$SCRIPT_DIR/listen.sh"                       "$PI_HOME/sitestream/listen.sh"
+cp "$SCRIPT_DIR/generate-onboarding-screen.sh"  "$PI_HOME/sitestream/generate-onboarding-screen.sh"
+cp "$SCRIPT_DIR/install.sh"                     "$PI_HOME/sitestream/install.sh"
 chmod +x "$PI_HOME/sitestream/sync.sh"
 chmod +x "$PI_HOME/sitestream/player.sh"
 chmod +x "$PI_HOME/sitestream/listen.sh"
+chmod +x "$PI_HOME/sitestream/generate-onboarding-screen.sh"
 chmod +x "$PI_HOME/sitestream/install.sh"
 chown -R "$PI_USER:$PI_GROUP" "$PI_HOME/sitestream"
 
@@ -176,6 +190,21 @@ RestartSec=5
 # main listen.sh process, sparing children like that in-flight sync.sh so it
 # can finish normally. Exact same reasoning as sitestream-player.service's
 # KillMode=process, different concrete symptom.
+#
+# Expected side effect, not a bug: every time this happens, journalctl logs
+# a block like "Found left-over process NNNN (sync.sh) in control group
+# while starting unit. Ignoring." (plus its sudo/systemctl/sleep children,
+# and "This usually indicates unclean termination of a previous run, or
+# service implementation deficiencies" underneath each one). That generic
+# wording is systemd's one-size-fits-all message for any spared cgroup
+# member — it does NOT mean anything leaked or failed to clean up. The old
+# listen.sh (that sync.sh's real parent) exits during the restart, Linux
+# re-parents the still-running sync.sh (and its children) to init/PID 1,
+# and they're reaped normally the moment they finish their own last few
+# lines a couple seconds later — same as any other orphaned process on
+# Linux. Expect to see this exact log block on every push-triggered
+# self-update, indefinitely; it's the visible signature of this fix working,
+# not something to chase.
 KillMode=process
 
 [Install]
