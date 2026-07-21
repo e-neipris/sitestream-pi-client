@@ -12,6 +12,8 @@
 #      apply_sync_interval), rather than staying silent for up to a full hour
 #      at the slowest configured interval
 #   1c. Reboots if an admin requested it (acknowledges first, then reboots)
+#   1c-bis. Factory-resets if an admin requested it (acknowledges first, then
+#      runs factory-reset.sh — see that script for what it actually clears)
 #   1d. Adjusts its own cron schedule if the zone's configured interval changed
 #   2. Downloads any videos not yet cached locally (compares ETags)
 #   3. Deletes videos that are no longer in the schedule (frees SD card space)
@@ -267,6 +269,30 @@ if [ "$REBOOT_REQUESTED" = "true" ]; then
   fi
 fi
 
+# ── 1c-bis. Handle a pending factory-reset request ────────────────────────────
+# Same one-shot ack-before-acting reasoning as the reboot handling above —
+# only acts once the server has confirmed the ack, so a flaky-network ack
+# failure means retrying next cycle instead of factory-resetting again on
+# every subsequent one. factory-reset.sh itself restarts both services (and,
+# thanks to KillMode=process on sitestream-listen.service, safely survives
+# restarting its own parent if this particular run was itself push-triggered
+# — see install.sh) — so this process's own remaining steps below would
+# otherwise run against a config.env/state that's already been wiped out from
+# under them. Exiting right after is deliberate, not just tidy.
+FACTORY_RESET_REQUESTED=$(echo "$MANIFEST" | jq -r '.factoryReset // false')
+if [ "$FACTORY_RESET_REQUESTED" = "true" ]; then
+  DEVICE_ID=$(echo "$MANIFEST" | jq -r '.deviceId')
+  log "Factory reset requested via admin panel — acknowledging…"
+  if curl -sf -X POST -H "Authorization: Bearer $DEVICE_TOKEN" --max-time 15 \
+       "$API_URL/api/devices/$DEVICE_ID/factory-reset/ack" > /dev/null; then
+    log "Acknowledged. Running factory reset now."
+    "$SITESTREAM_DIR/factory-reset.sh" --yes
+    exit 0
+  else
+    log "WARN: could not reach API to acknowledge factory reset — skipping this cycle, will retry."
+  fi
+fi
+
 # ── 1d. Adjust the cron schedule if the zone's configured interval changed ───
 # Set in the zone's Configuration tab (default 15 min; 1 min is dev/testing
 # only — see SYNC_INTERVAL_MINUTES in packages/api/src/routes/zones.ts).
@@ -279,7 +305,6 @@ fi
 apply_sync_interval "$(echo "$MANIFEST" | jq -r '.syncIntervalMinutes // 15')"
 
 # ── 2. Download missing / updated videos ──────────────────────────────────────
-SCHEDULE=$(echo "$MANIFEST" | jq -c '.schedule[]')
 NEEDED_IDS=()
 
 while IFS= read -r entry; do
@@ -320,7 +345,16 @@ while IFS= read -r entry; do
       log "ERROR: Failed to download $FILENAME after retries. Keeping partial data to resume next run."
     fi
   fi
-done <<< "$(echo "$MANIFEST" | jq -c '.schedule[]')"
+done < <(echo "$MANIFEST" | jq -c '.schedule[]')
+# Process substitution (< <(...)), not a here-string (<<< "$(...)") — a
+# here-string always appends a trailing newline to whatever it's given, so
+# for a zone with zero schedule entries (jq's .[] produces truly zero bytes
+# of output), the old form still fed `read` one lone newline: exactly one
+# phantom iteration with every field empty, producing "Downloading  ()…"
+# and a doomed download attempt against an empty URL — confirmed live
+# against a fresh zone with no schedule at all. Process substitution
+# connects the loop directly to the command's real output stream with no
+# such injection, so zero bytes in means zero iterations, correctly.
 
 # ── 3. Remove videos no longer in schedule ────────────────────────────────────
 for f in "$VIDEO_DIR"/*.mp4; do
@@ -482,7 +516,7 @@ if [ -n "$UPDATE_VERSION" ] && [ "$UPDATE_VERSION" != "$INSTALLED_VERSION" ]; th
 
   if [ "$DOWNLOAD_OK" = true ] && tar -xzf "$UPDATE_TARBALL" -C "$UPDATE_TMP_DIR" 2>>"$SITESTREAM_DIR/logs/sync.log"; then
     APPLY_OK=true
-    for f in sync.sh player.sh install.sh listen.sh generate-onboarding-screen.sh; do
+    for f in sync.sh player.sh install.sh listen.sh generate-onboarding-screen.sh factory-reset.sh; do
       if [ ! -f "$UPDATE_TMP_DIR/$f" ]; then
         log "ERROR: update tarball for $UPDATE_VERSION is missing $f — aborting update, staying on '${INSTALLED_VERSION:-none}'."
         APPLY_OK=false
@@ -491,7 +525,7 @@ if [ -n "$UPDATE_VERSION" ] && [ "$UPDATE_VERSION" != "$INSTALLED_VERSION" ]; th
     done
 
     if [ "$APPLY_OK" = true ]; then
-      chmod +x "$UPDATE_TMP_DIR/sync.sh" "$UPDATE_TMP_DIR/player.sh" "$UPDATE_TMP_DIR/install.sh" "$UPDATE_TMP_DIR/listen.sh" "$UPDATE_TMP_DIR/generate-onboarding-screen.sh"
+      chmod +x "$UPDATE_TMP_DIR/sync.sh" "$UPDATE_TMP_DIR/player.sh" "$UPDATE_TMP_DIR/install.sh" "$UPDATE_TMP_DIR/listen.sh" "$UPDATE_TMP_DIR/generate-onboarding-screen.sh" "$UPDATE_TMP_DIR/factory-reset.sh"
       # mv (rename), not copy-in-place — this process keeps its already-open
       # fd on the old sync.sh inode via the still-running interpreter, so
       # replacing the filename out from under it is safe. The one rule is
@@ -502,6 +536,7 @@ if [ -n "$UPDATE_VERSION" ] && [ "$UPDATE_VERSION" != "$INSTALLED_VERSION" ]; th
       mv "$UPDATE_TMP_DIR/install.sh" "$SITESTREAM_DIR/install.sh"
       mv "$UPDATE_TMP_DIR/listen.sh" "$SITESTREAM_DIR/listen.sh"
       mv "$UPDATE_TMP_DIR/generate-onboarding-screen.sh" "$SITESTREAM_DIR/generate-onboarding-screen.sh"
+      mv "$UPDATE_TMP_DIR/factory-reset.sh" "$SITESTREAM_DIR/factory-reset.sh"
       echo "$UPDATE_VERSION" > "$INSTALLED_VERSION_FILE"
 
       log "Updated to $UPDATE_VERSION. Restarting player and listener services."
