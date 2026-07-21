@@ -105,6 +105,15 @@ EOF
 rm -f /etc/cron.d/sitestream-sync  # clean up the old mechanism, in case install.sh is being re-run
 CRON_LINE="* * * * * $PI_HOME/sitestream/sync.sh >> $PI_HOME/sitestream/logs/sync.log 2>&1"
 (crontab -u "$PI_USER" -l 2>/dev/null | grep -v "sitestream/sync.sh"; echo "$CRON_LINE") | crontab -u "$PI_USER" -
+# sync.sh caches the interval it last wrote to crontab (.sync_interval) so it
+# doesn't rewrite crontab on every single run — only when the target value
+# actually changes. That cache has no way to know we just reset crontab out
+# from under it above, so on a re-run of this script it would see "target
+# matches what I last applied" and skip rewriting, silently leaving the
+# device on this 1-minute default forever instead of the zone's real
+# interval. Clearing it forces sync.sh's next run to always re-verify and
+# rewrite, regardless of what it remembers applying before.
+rm -f "$PI_HOME/sitestream/.sync_interval"
 
 # ── Autostart VLC via systemd service ─────────────────────────────────────────
 # Safe to enable even before claiming — player.sh just idles with nothing to
@@ -157,6 +166,17 @@ User=$PI_USER
 ExecStart=$PI_HOME/sitestream/listen.sh
 Restart=always
 RestartSec=5
+# Default KillMode (control-group) signals every process in this service's
+# cgroup on restart — including sync.sh, which listen.sh spawns as a
+# backgrounded child every time it reacts to a push (see trigger_sync() in
+# listen.sh). A self-update's own sync.sh run restarts THIS service (to pick
+# up the new listen.sh) as one of its last steps — with the default KillMode
+# that kills the very sync.sh process doing the restarting, right before it
+# can report the update back to the API. KillMode=process signals only the
+# main listen.sh process, sparing children like that in-flight sync.sh so it
+# can finish normally. Exact same reasoning as sitestream-player.service's
+# KillMode=process, different concrete symptom.
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target

@@ -39,7 +39,11 @@ shopt -s lastpipe
 trigger_sync() {
   local reason="$1"
   log "Triggering immediate sync ($reason)…"
-  "$SITESTREAM_DIR/sync.sh" >> "$SITESTREAM_DIR/logs/sync.log" 2>&1 &
+  # SYNC_TRIGGER=push tells sync.sh to skip its cron-only jitter sleep and to
+  # block-and-wait on its lock instead of skipping if another run is already
+  # in flight — see the matching comment in sync.sh for why a push-triggered
+  # run can't be allowed to silently no-op the way a cron tick can.
+  SYNC_TRIGGER=push "$SITESTREAM_DIR/sync.sh" >> "$SITESTREAM_DIR/logs/sync.log" 2>&1 &
 }
 
 # Runs alongside the SSE read loop below, polling for player.sh's urgent-

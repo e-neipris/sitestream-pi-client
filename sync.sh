@@ -127,25 +127,42 @@ apply_sync_interval() {
   fi
 }
 
-# At a fast sync interval (as low as 1 minute), a large in-progress download
-# can easily still be running when the next tick fires. flock -n on an fd
-# tied to a lock file makes a second invocation exit immediately instead of
-# starting a competing download into the same temp file.
+# listen.sh sets SYNC_TRIGGER=push when it invokes this script in response to
+# a server-sent "wake up now" event — see trigger_sync() in listen.sh. That's
+# a specific, one-time "something changed, act now" request with no
+# automatic follow-up if it gets dropped, unlike a cron tick (where a missed
+# run doesn't matter — the next one is only 1-15 min away regardless). The
+# two invocation modes need different lock and jitter handling below because
+# of that difference.
 exec 200>"$SITESTREAM_DIR/.sync.lock"
-if ! flock -n 200; then
-  log "Previous sync.sh still running — skipping this run."
-  exit 0
-fi
+if [ "$SYNC_TRIGGER" = "push" ]; then
+  # Block and wait for any in-flight run to finish rather than skipping —
+  # dropping a push-triggered sync silently defeats the entire point of
+  # having it (the whole reason it exists is to avoid waiting up to the
+  # zone's full sync interval for a change to take effect).
+  flock 200
+else
+  # At a fast sync interval (as low as 1 minute), a large in-progress download
+  # can easily still be running when the next tick fires. flock -n on an fd
+  # tied to a lock file makes a second invocation exit immediately instead of
+  # starting a competing download into the same temp file — fine here since
+  # the next tick will just try again shortly.
+  if ! flock -n 200; then
+    log "Previous sync.sh still running — skipping this run."
+    exit 0
+  fi
 
-# Jitter: every device on the same zone typically shares the same cron
-# cadence, and cron fires all of them at the same wall-clock second — so
-# without this they'd all hit the API in the same instant, every cycle, not
-# just during an outage-recovery burst. A small random delay before any
-# network call spreads that out. Kept short (not scaled to the sync
-# interval) so it doesn't meaningfully delay time-sensitive things like a
-# pending reboot or schedule push — worst case a few tens of seconds, not
-# minutes.
-sleep $((RANDOM % 46))
+  # Jitter: every device on the same zone typically shares the same cron
+  # cadence, and cron fires all of them at the same wall-clock second — so
+  # without this they'd all hit the API in the same instant, every cycle, not
+  # just during an outage-recovery burst. A small random delay before any
+  # network call spreads that out. Only applies to cron-triggered runs — a
+  # push-triggered run's entire purpose is to react immediately, so jittering
+  # it would silently reintroduce the exact latency this feature exists to
+  # remove (confirmed: a real push-triggered run measured ~38s from trigger
+  # to confirmed heartbeat, almost entirely this sleep).
+  sleep $((RANDOM % 46))
+fi
 
 # ── 0. Zero-touch provisioning ─────────────────────────────────────────────────
 # No token baked in at install time — the Pi identifies itself by hardware
@@ -489,6 +506,29 @@ if [ -n "$UPDATE_VERSION" ] && [ "$UPDATE_VERSION" != "$INSTALLED_VERSION" ]; th
       log "Updated to $UPDATE_VERSION. Restarting player and listener services."
       sudo systemctl restart sitestream-player.service 2>>"$SITESTREAM_DIR/logs/sync.log" \
         || log "WARN: could not restart sitestream-player.service (sudoers rule missing? see install.sh)"
+
+      # The regular heartbeat (step 5, above) already fired earlier in this
+      # same run — reporting whatever INSTALLED_VERSION was BEFORE this
+      # update was applied, since self-update runs after it. Without this,
+      # the API (and the admin UI) would show the device stuck on the old
+      # version until its next scheduled cycle, even though it's already
+      # running the new code — a needless gap, and confusing right after an
+      # admin deliberately pushes a firmware update. One more lightweight
+      # heartbeat here reports the truth immediately, right after it changes.
+      #
+      # Deliberately BEFORE restarting sitestream-listen.service below, not
+      # after: when this run was itself triggered by a push (a background
+      # child of listen.sh — see trigger_sync() in listen.sh), restarting
+      # that service restarts this process's own parent. Even with
+      # KillMode=process on that unit (see install.sh) sparing this child
+      # process, there's no reason to place anything this important after an
+      # action that touches the very service tree this process lives in.
+      curl -sf -X POST -H "Authorization: Bearer $DEVICE_TOKEN" -H "Content-Type: application/json" \
+        -d "$(jq -n --arg installedVersion "$UPDATE_VERSION" '{installedVersion: $installedVersion}')" \
+        --max-time 15 \
+        "$API_URL/api/devices/$(echo "$MANIFEST" | jq -r '.deviceId')/heartbeat" \
+        > /dev/null || log "WARN: could not report updated version to API (will report on next cycle instead)"
+
       # Older devices updating for the first time past this release won't have
       # this unit yet (self-update never re-runs install.sh's system-level
       # setup — see the header note above) — that's expected, not an error;
