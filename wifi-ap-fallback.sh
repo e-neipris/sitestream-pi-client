@@ -69,6 +69,14 @@ hotspot_active() {
 start_hotspot() {
   hotspot_active && return
   log "No network connectivity and not yet claimed — starting setup hotspot '$SSID'"
+  # A freshly-imaged Raspberry Pi OS install can leave the Wi-Fi radio
+  # itself soft-disabled at the NetworkManager level (nmcli radio -> WIFI:
+  # disabled), independent of the wlan0 hardware/driver being fine. When
+  # that's the case `nmcli device wifi hotspot` fails every single time with
+  # "device is not available" and never recovers on its own — confirmed live
+  # against a brand-new Pi where this was the entire root cause of the
+  # hotspot never appearing. Idempotent/harmless if the radio is already on.
+  sudo -n nmcli radio wifi on >>"$SITESTREAM_DIR/logs/wifi-ap.log" 2>&1 || true
   # sudo -n, not a plain unprivileged call — creating/activating a
   # NetworkManager connection from a non-interactive systemd service (no
   # logind session) hit real polkit permission denials during testing of

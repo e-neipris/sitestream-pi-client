@@ -5,8 +5,10 @@ schedule.json
 .manifest_hash
 .schedule_updated
 
-# Built pi-portal bundle (standalone-mode local portal) — source lives in
-# the main SiteStream monorepo's packages/pi-portal; this is just the build
-# output copied in here for packaging into a release tarball, regenerated
-# each time, not checked in.
-pi-portal/
+# pi-portal (standalone-mode local portal) — source is tracked here; only
+# build output and installed deps are regenerated (npm run build in each of
+# server/ and web/) and excluded, same as any other Node project.
+pi-portal/server/dist/
+pi-portal/server/node_modules/
+pi-portal/web/node_modules/
+pi-portal/web-dist/

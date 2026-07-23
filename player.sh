@@ -17,6 +17,14 @@ LOG_PREFIX="[PLAYER $(date '+%H:%M:%S')]"
 log() { echo "$LOG_PREFIX $1"; }
 
 CURRENT_VIDEO_PATH=""
+# mtime of the onboarding/idle PNG the last time we told VLC to load it.
+# Those two screens are fixed filenames regenerated in place (new QR/text
+# content, same path) whenever connectivity or claim state changes — VLC has
+# no idea the bytes under an already-open, --loop'd file changed, so without
+# this it just keeps looping whatever it first loaded forever. Tracked
+# separately from CURRENT_VIDEO_PATH (which only tells us the path is the
+# same, not that the content behind it is still the same).
+CURRENT_STATIC_IMAGE_MTIME=""
 CURRENT_MULTICAST_TARGET=""
 VLC_PID=""
 MULTICAST_PID=""
@@ -199,12 +207,27 @@ stop_vlc() {
   fi
   VLC_PID=""
   CURRENT_VIDEO_PATH=""
+  CURRENT_STATIC_IMAGE_MTIME=""
   stop_multicast
   pkill -f "vlc" 2>/dev/null || true
 }
 
+# Used only for the onboarding/idle static-image screens — see
+# CURRENT_STATIC_IMAGE_MTIME above for why path-equality alone isn't enough
+# to know whether VLC needs to be told to reload.
+get_mtime() {
+  stat -c '%Y' "$1" 2>/dev/null
+}
+
 start_vlc() {
   local video_path="$1"
+  # "no-multicast": used for the onboarding/idle static-image screens below —
+  # start_multicast expects an actual video file to remux into MPEG-TS, and
+  # feeding it a static PNG instead would push a broken/garbage stream to
+  # whatever IPTV tuner is consuming this device's multicast output for the
+  # entire time no real content is scheduled. Real scheduled video playback
+  # never passes this.
+  local skip_multicast="${2:-}"
   stop_vlc
   log "Starting VLC: $video_path"
 
@@ -255,7 +278,9 @@ start_vlc() {
   LAST_DISPLAYED_PICTURES="0"
   STALL_COUNT=0
 
-  start_multicast "$video_path"
+  if [ "$skip_multicast" != "no-multicast" ]; then
+    start_multicast "$video_path"
+  fi
 }
 
 # Returns the local file path that should be playing right now, or empty string
@@ -316,9 +341,13 @@ while true; do
   if [ -z "$DEVICE_TOKEN" ]; then
     "$SITESTREAM_DIR/generate-onboarding-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
     ONBOARDING_IMAGE="$SITESTREAM_DIR/onboarding.png"
-    if [ -f "$ONBOARDING_IMAGE" ] && { [ "$CURRENT_VIDEO_PATH" != "$ONBOARDING_IMAGE" ] || ! kill -0 "$VLC_PID" 2>/dev/null; }; then
-      log "Not yet claimed — showing onboarding screen (serial + QR code)."
-      start_vlc "$ONBOARDING_IMAGE"
+    if [ -f "$ONBOARDING_IMAGE" ]; then
+      ONBOARDING_MTIME=$(get_mtime "$ONBOARDING_IMAGE")
+      if [ "$CURRENT_VIDEO_PATH" != "$ONBOARDING_IMAGE" ] || [ "$ONBOARDING_MTIME" != "$CURRENT_STATIC_IMAGE_MTIME" ] || ! kill -0 "$VLC_PID" 2>/dev/null; then
+        log "Not yet claimed — showing onboarding screen (serial + QR code)."
+        start_vlc "$ONBOARDING_IMAGE" no-multicast
+        CURRENT_STATIC_IMAGE_MTIME="$ONBOARDING_MTIME"
+      fi
     fi
     write_status
     sleep 30
@@ -328,10 +357,28 @@ while true; do
   WANTED=$(get_current_video)
 
   if [ -z "$WANTED" ]; then
-    # Nothing scheduled right now
-    if { [ -n "$VLC_PID" ] && kill -0 "$VLC_PID" 2>/dev/null; } || { [ -n "$MULTICAST_PID" ] && kill -0 "$MULTICAST_PID" 2>/dev/null; }; then
-      log "No video scheduled — stopping player."
-      stop_vlc
+    # Nothing scheduled right now — show an idle screen (serial + how to
+    # manage this device) instead of leaving the display blank. Same
+    # idempotent-regeneration approach as the onboarding screen above: cheap
+    # to call every tick, only actually rewrites the PNG when something
+    # relevant (this device's IP) has changed.
+    "$SITESTREAM_DIR/generate-idle-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
+    IDLE_IMAGE="$SITESTREAM_DIR/idle.png"
+    if [ -f "$IDLE_IMAGE" ]; then
+      IDLE_MTIME=$(get_mtime "$IDLE_IMAGE")
+      if [ "$CURRENT_VIDEO_PATH" != "$IDLE_IMAGE" ] || [ "$IDLE_MTIME" != "$CURRENT_STATIC_IMAGE_MTIME" ] || ! kill -0 "$VLC_PID" 2>/dev/null; then
+        log "No video scheduled — showing idle screen."
+        start_vlc "$IDLE_IMAGE" no-multicast
+        CURRENT_STATIC_IMAGE_MTIME="$IDLE_MTIME"
+      fi
+    else
+      # Couldn't generate the idle screen (missing qrencode/imagemagick?) —
+      # fall back to the old blank-screen behavior rather than show nothing
+      # at all while also leaving a stale video frozen on screen.
+      if { [ -n "$VLC_PID" ] && kill -0 "$VLC_PID" 2>/dev/null; } || { [ -n "$MULTICAST_PID" ] && kill -0 "$MULTICAST_PID" 2>/dev/null; }; then
+        log "No video scheduled — stopping player."
+        stop_vlc
+      fi
     fi
   elif [ ! -f "$WANTED" ]; then
     log "WARN: Scheduled video not found locally: $WANTED (waiting for sync)"

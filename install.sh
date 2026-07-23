@@ -167,6 +167,7 @@ if [ "$SCRIPT_DIR" != "$PI_HOME/sitestream" ]; then
   cp "$SCRIPT_DIR/player.sh"                      "$PI_HOME/sitestream/player.sh"
   cp "$SCRIPT_DIR/listen.sh"                       "$PI_HOME/sitestream/listen.sh"
   cp "$SCRIPT_DIR/generate-onboarding-screen.sh"  "$PI_HOME/sitestream/generate-onboarding-screen.sh"
+  cp "$SCRIPT_DIR/generate-idle-screen.sh"        "$PI_HOME/sitestream/generate-idle-screen.sh"
   cp "$SCRIPT_DIR/factory-reset.sh"               "$PI_HOME/sitestream/factory-reset.sh"
   cp "$SCRIPT_DIR/wifi-ap-fallback.sh"            "$PI_HOME/sitestream/wifi-ap-fallback.sh"
   cp "$SCRIPT_DIR/install.sh"                     "$PI_HOME/sitestream/install.sh"
@@ -175,6 +176,7 @@ chmod +x "$PI_HOME/sitestream/sync.sh"
 chmod +x "$PI_HOME/sitestream/player.sh"
 chmod +x "$PI_HOME/sitestream/listen.sh"
 chmod +x "$PI_HOME/sitestream/generate-onboarding-screen.sh"
+chmod +x "$PI_HOME/sitestream/generate-idle-screen.sh"
 chmod +x "$PI_HOME/sitestream/factory-reset.sh"
 chmod +x "$PI_HOME/sitestream/wifi-ap-fallback.sh"
 chmod +x "$PI_HOME/sitestream/install.sh"
@@ -512,6 +514,7 @@ $PI_USER ALL=(root) NOPASSWD: $HOSTNAMECTL_BIN set-hostname *
 $PI_USER ALL=(root) NOPASSWD: $IW_BIN_FOR_SUDOERS dev * scan
 $PI_USER ALL=(root) NOPASSWD: $NMCLI_BIN device wifi hotspot *
 $PI_USER ALL=(root) NOPASSWD: $NMCLI_BIN connection down *
+$PI_USER ALL=(root) NOPASSWD: $NMCLI_BIN radio wifi on
 EOF
 chmod 440 /etc/sudoers.d/sitestream
 if ! visudo -c -f /etc/sudoers.d/sitestream >/dev/null 2>&1; then
