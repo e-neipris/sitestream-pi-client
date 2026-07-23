@@ -22,7 +22,9 @@
 #      telemetry (player.sh's live status, CPU temp, disk, uptime)
 #   6. Signals player.sh to re-read the schedule
 #   7. Applies a pending pi-client update, if the manifest targets a release
-#      different from what's installed — see the self-update section below
+#      different from what's installed — copies the whole release through and
+#      re-runs install.sh unattended (as root, via a scoped sudo grant) to
+#      apply anything system-level the release needs, not just script files
 
 set -e
 
@@ -31,6 +33,9 @@ CONFIG="$SITESTREAM_DIR/config.env"
 [ -f "$CONFIG" ] && source "$CONFIG"
 
 API_URL="${API_URL:-https://api.sitestream.app}"
+# Needed so self-update can re-invoke install.sh unattended with the right
+# value (see step 7 below) — same fallback pattern as API_URL above.
+APP_URL="${APP_URL:-https://app.sitestream.app}"
 VIDEO_DIR="${VIDEO_DIR:-$SITESTREAM_DIR/videos}"
 SCHEDULE_FILE="$SITESTREAM_DIR/schedule.json"
 MANIFEST_HASH_FILE="$SITESTREAM_DIR/.manifest_hash"
@@ -235,15 +240,75 @@ log "Manifest version: $MANIFEST_VERSION"
 MULTICAST_ENABLED=$(echo "$MANIFEST" | jq -r '.multicastEnabled // false')
 MULTICAST_ADDRESS=$(echo "$MANIFEST" | jq -r '.multicastAddress // empty')
 MULTICAST_PORT=$(echo "$MANIFEST" | jq -r '.multicastPort // empty')
+# Which NIC actually carries the multicast stream (e.g. "eth0") — only set
+# when this device also needs a different interface (e.g. "wlan0") for its
+# own SaaS traffic. Empty means "let VLC/the OS pick," same as before this
+# existed — see player.sh's start_multicast for where this is consumed.
+MULTICAST_INTERFACE=$(echo "$MANIFEST" | jq -r '.multicastInterface // empty')
 
-grep -vE '^(MULTICAST_ENABLED|MULTICAST_ADDRESS|MULTICAST_PORT)=' "$CONFIG" 2>/dev/null > "$CONFIG.tmp" || true
+grep -vE '^(MULTICAST_ENABLED|MULTICAST_ADDRESS|MULTICAST_PORT|MULTICAST_INTERFACE)=' "$CONFIG" 2>/dev/null > "$CONFIG.tmp" || true
 {
   echo "MULTICAST_ENABLED=$MULTICAST_ENABLED"
   echo "MULTICAST_ADDRESS=$MULTICAST_ADDRESS"
   echo "MULTICAST_PORT=$MULTICAST_PORT"
+  echo "MULTICAST_INTERFACE=$MULTICAST_INTERFACE"
 } >> "$CONFIG.tmp"
 mv "$CONFIG.tmp" "$CONFIG"
 chmod 600 "$CONFIG"
+
+# ── 1b2. Apply cloud-pushed system config (timezone, hostname, Wi-Fi) ────────
+# Unlike multicast above (which player.sh reads and acts on itself), nothing
+# else in this codebase applies these — sync.sh has to actually call the
+# same sudo-granted commands the standalone portal's System tab uses (see
+# install.sh's sudoers.d/sitestream). Applied in this specific order:
+# timezone/hostname first (harmless either way), Wi-Fi LAST — joining a
+# different network can drop THIS device's own connectivity immediately,
+# so everything else useful in this run happens before that risk, same
+# "riskiest step last" reasoning as the self-update section further down.
+NEW_TIMEZONE=$(echo "$MANIFEST" | jq -r '.timezone // empty')
+NEW_HOSTNAME=$(echo "$MANIFEST" | jq -r '.hostname // empty')
+NEW_WIFI_SSID=$(echo "$MANIFEST" | jq -r '.wifiSsid // empty')
+NEW_WIFI_PASSWORD=$(echo "$MANIFEST" | jq -r '.wifiPassword // empty')
+
+grep -vE '^(WIFI_SSID|WIFI_PASSWORD)=' "$CONFIG" 2>/dev/null > "$CONFIG.tmp" || true
+{
+  echo "WIFI_SSID=$NEW_WIFI_SSID"
+  echo "WIFI_PASSWORD=$NEW_WIFI_PASSWORD"
+} >> "$CONFIG.tmp"
+mv "$CONFIG.tmp" "$CONFIG"
+chmod 600 "$CONFIG"
+
+if [ -n "$NEW_TIMEZONE" ]; then
+  CURRENT_TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null || echo "")
+  if [ "$NEW_TIMEZONE" != "$CURRENT_TIMEZONE" ]; then
+    log "Applying timezone from cloud config: $NEW_TIMEZONE"
+    sudo -n timedatectl set-timezone "$NEW_TIMEZONE" 2>>"$SITESTREAM_DIR/logs/sync.log" || log "WARN: could not set timezone to $NEW_TIMEZONE"
+  fi
+fi
+
+if [ -n "$NEW_HOSTNAME" ]; then
+  CURRENT_HOSTNAME=$(hostname)
+  if [ "$NEW_HOSTNAME" != "$CURRENT_HOSTNAME" ]; then
+    log "Applying hostname from cloud config: $NEW_HOSTNAME"
+    sudo -n hostnamectl set-hostname "$NEW_HOSTNAME" 2>>"$SITESTREAM_DIR/logs/sync.log" || log "WARN: could not set hostname to $NEW_HOSTNAME"
+  fi
+fi
+
+# Tracked via a cache file, not a live "what network are we actually on"
+# check — querying that reliably means parsing `iw`/`nmcli` output keyed to
+# a specific interface name, the exact fragility already hit (and fixed) in
+# the portal's own Wi-Fi scan. Same idea as .sync_interval below: only act
+# when the CLOUD value actually changes from what was last applied.
+WIFI_SSID_CACHE_FILE="$SITESTREAM_DIR/.wifi_ssid_applied"
+LAST_APPLIED_SSID=$(cat "$WIFI_SSID_CACHE_FILE" 2>/dev/null || echo "")
+if [ -n "$NEW_WIFI_SSID" ] && [ "$NEW_WIFI_SSID" != "$LAST_APPLIED_SSID" ]; then
+  log "Applying Wi-Fi credentials from cloud config: joining '$NEW_WIFI_SSID'"
+  if sudo -n raspi-config nonint do_wifi_ssid_passphrase "$NEW_WIFI_SSID" "$NEW_WIFI_PASSWORD" 2>>"$SITESTREAM_DIR/logs/sync.log"; then
+    echo "$NEW_WIFI_SSID" > "$WIFI_SSID_CACHE_FILE"
+  else
+    log "WARN: could not join Wi-Fi network $NEW_WIFI_SSID"
+  fi
+fi
 
 # ── 1c. Handle a pending reboot request ───────────────────────────────────────
 # One-shot admin command, not a persistent target state like the update
@@ -499,11 +564,14 @@ touch "$SITESTREAM_DIR/.schedule_updated"
 # update path. Runs last so a normal cycle's core job (schedule/video sync)
 # always completes first, even on the one cycle that also finds an update.
 #
-# Known limitation: this only replaces the three script files. It does NOT
-# re-run install.sh's system-level setup (new apt packages, new systemd
-# units, new sudoers rules) — those still need a manual install.sh re-run.
-# This mechanism is for script-logic fixes (like the ones made this session),
-# not changes that touch the Pi's system configuration.
+# Copies the WHOLE extracted tarball into place (not a fixed list of named
+# files) and then re-runs install.sh itself, unattended, as root — install.sh
+# already handles everything a release might need (new apt packages, new/
+# changed systemd units, new directories like pi-portal/) and is already
+# proven idempotent/safe to re-run, so this is genuinely "do what a human
+# re-running it by hand would do," not a second, narrower update mechanism
+# to keep in sync with install.sh by hand. Needs the install.sh sudoers
+# grant (see install.sh) since sync.sh itself runs unprivileged.
 UPDATE_VERSION=$(echo "$MANIFEST" | jq -r '.update.version // empty')
 UPDATE_URL=$(echo "$MANIFEST" | jq -r '.update.downloadUrl // empty')
 
@@ -515,33 +583,23 @@ if [ -n "$UPDATE_VERSION" ] && [ "$UPDATE_VERSION" != "$INSTALLED_VERSION" ]; th
   download_with_retries "$UPDATE_URL" "$UPDATE_TARBALL" "pi-client update $UPDATE_VERSION"
 
   if [ "$DOWNLOAD_OK" = true ] && tar -xzf "$UPDATE_TARBALL" -C "$UPDATE_TMP_DIR" 2>>"$SITESTREAM_DIR/logs/sync.log"; then
-    APPLY_OK=true
-    for f in sync.sh player.sh install.sh listen.sh generate-onboarding-screen.sh factory-reset.sh; do
-      if [ ! -f "$UPDATE_TMP_DIR/$f" ]; then
-        log "ERROR: update tarball for $UPDATE_VERSION is missing $f — aborting update, staying on '${INSTALLED_VERSION:-none}'."
-        APPLY_OK=false
-        break
-      fi
-    done
-
-    if [ "$APPLY_OK" = true ]; then
-      chmod +x "$UPDATE_TMP_DIR/sync.sh" "$UPDATE_TMP_DIR/player.sh" "$UPDATE_TMP_DIR/install.sh" "$UPDATE_TMP_DIR/listen.sh" "$UPDATE_TMP_DIR/generate-onboarding-screen.sh" "$UPDATE_TMP_DIR/factory-reset.sh"
-      # mv (rename), not copy-in-place — this process keeps its already-open
-      # fd on the old sync.sh inode via the still-running interpreter, so
-      # replacing the filename out from under it is safe. The one rule is
-      # not to try to re-exec/source the new file from this same process —
-      # we just exit right after, and cron's next tick starts fresh from it.
-      mv "$UPDATE_TMP_DIR/sync.sh" "$SITESTREAM_DIR/sync.sh"
-      mv "$UPDATE_TMP_DIR/player.sh" "$SITESTREAM_DIR/player.sh"
-      mv "$UPDATE_TMP_DIR/install.sh" "$SITESTREAM_DIR/install.sh"
-      mv "$UPDATE_TMP_DIR/listen.sh" "$SITESTREAM_DIR/listen.sh"
-      mv "$UPDATE_TMP_DIR/generate-onboarding-screen.sh" "$SITESTREAM_DIR/generate-onboarding-screen.sh"
-      mv "$UPDATE_TMP_DIR/factory-reset.sh" "$SITESTREAM_DIR/factory-reset.sh"
+    # Sanity check against a genuinely broken/empty tarball — not an
+    # exhaustive per-file allowlist to keep updating whenever a release
+    # adds something new (like pi-portal/ did).
+    if [ ! -f "$UPDATE_TMP_DIR/sync.sh" ] || [ ! -f "$UPDATE_TMP_DIR/install.sh" ]; then
+      log "ERROR: update tarball for $UPDATE_VERSION is missing sync.sh/install.sh — aborting update, staying on '${INSTALLED_VERSION:-none}'."
+    else
+      chmod +x "$UPDATE_TMP_DIR"/*.sh
+      # cp -rf (not mv) the whole extracted tree — copying everything in one
+      # shot, including files/directories this script has never heard of
+      # (pi-portal/, or whatever a future release adds), rather than moving
+      # a fixed list of names one at a time. This process keeps its
+      # already-open fd on the old sync.sh inode via the still-running
+      # interpreter (same as before), so overwriting the file out from
+      # under it is safe — the one rule is still not to re-exec/source the
+      # new file from this same process; we just exit right after.
+      cp -rf "$UPDATE_TMP_DIR"/. "$SITESTREAM_DIR"/
       echo "$UPDATE_VERSION" > "$INSTALLED_VERSION_FILE"
-
-      log "Updated to $UPDATE_VERSION. Restarting player and listener services."
-      sudo systemctl restart sitestream-player.service 2>>"$SITESTREAM_DIR/logs/sync.log" \
-        || log "WARN: could not restart sitestream-player.service (sudoers rule missing? see install.sh)"
 
       # The regular heartbeat (step 5, above) already fired earlier in this
       # same run — reporting whatever INSTALLED_VERSION was BEFORE this
@@ -550,27 +608,31 @@ if [ -n "$UPDATE_VERSION" ] && [ "$UPDATE_VERSION" != "$INSTALLED_VERSION" ]; th
       # version until its next scheduled cycle, even though it's already
       # running the new code — a needless gap, and confusing right after an
       # admin deliberately pushes a firmware update. One more lightweight
-      # heartbeat here reports the truth immediately, right after it changes.
-      #
-      # Deliberately BEFORE restarting sitestream-listen.service below, not
-      # after: when this run was itself triggered by a push (a background
-      # child of listen.sh — see trigger_sync() in listen.sh), restarting
-      # that service restarts this process's own parent. Even with
-      # KillMode=process on that unit (see install.sh) sparing this child
-      # process, there's no reason to place anything this important after an
-      # action that touches the very service tree this process lives in.
+      # heartbeat here reports the truth immediately, right after it
+      # changes — deliberately BEFORE the install.sh re-run below, which is
+      # the riskiest, longest-running step here (apt-get, systemd, npm
+      # install for pi-portal): if that step fails or hangs for any reason,
+      # the version bump has already been reported successfully regardless.
       curl -sf -X POST -H "Authorization: Bearer $DEVICE_TOKEN" -H "Content-Type: application/json" \
         -d "$(jq -n --arg installedVersion "$UPDATE_VERSION" '{installedVersion: $installedVersion}')" \
         --max-time 15 \
         "$API_URL/api/devices/$(echo "$MANIFEST" | jq -r '.deviceId')/heartbeat" \
         > /dev/null || log "WARN: could not report updated version to API (will report on next cycle instead)"
 
-      # Older devices updating for the first time past this release won't have
-      # this unit yet (self-update never re-runs install.sh's system-level
-      # setup — see the header note above) — that's expected, not an error;
-      # it'll exist after their next manual install.sh re-run.
-      sudo systemctl restart sitestream-listen.service 2>>"$SITESTREAM_DIR/logs/sync.log" \
-        || log "WARN: could not restart sitestream-listen.service (not installed yet? re-run install.sh)"
+      log "Updated to $UPDATE_VERSION. Re-running install.sh to apply any system-level changes (packages, systemd units, pi-portal)…"
+      # This one call replaces what used to be two separate manual
+      # `systemctl restart` calls here — install.sh already restarts/starts
+      # every service it manages as part of its own normal setup. If this
+      # run was itself push-triggered (a background child of listen.sh —
+      # see trigger_sync() in listen.sh), install.sh restarting
+      # sitestream-listen.service restarts this process's own parent;
+      # KillMode=process on that unit (see install.sh) is what makes that
+      # survivable, same as it already was for the old restart call.
+      if sudo bash "$SITESTREAM_DIR/install.sh" "$API_URL" "$APP_URL" >> "$SITESTREAM_DIR/logs/sync.log" 2>&1; then
+        log "install.sh re-run succeeded."
+      else
+        log "WARN: install.sh re-run failed (sudoers rule missing? see install.sh) — script files are updated, but any system-level changes this release needed may not have applied. Check logs/sync.log."
+      fi
 
       rm -rf "$UPDATE_TMP_DIR"
       log "Update to $UPDATE_VERSION complete. Exiting — next cron tick runs the new sync.sh."

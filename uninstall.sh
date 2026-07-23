@@ -1,18 +1,26 @@
 #!/bin/bash
 # SiteStream Pi Client — uninstall
-# Reverses everything install.sh set up, so the Pi is back to a clean state.
-# Usage: sudo bash uninstall.sh [--purge-packages]
+# Reverses everything install.sh set up, so the Pi is back to exactly the
+# state it was in before install.sh ever ran.
+# Usage: sudo bash uninstall.sh [--purge-all-packages]
 #
-# --purge-packages: also apt-get remove vlc/jq/curl/cron, the packages
-#                    install.sh installed. Off by default — these are common
-#                    Raspberry Pi OS utilities other things on the box may
-#                    already depend on (cron in particular), so removing them
-#                    is opt-in rather than automatic.
+# By default, removes only the packages install.sh actually installed on
+# this specific Pi — recorded at install time in .packages_added_by_install,
+# since some of these (curl, cron especially) are very likely already on a
+# stock Raspberry Pi OS image. Blindly removing the whole list regardless of
+# origin wouldn't restore the prior state, it would go BELOW it — uninstalling
+# things that predate SiteStream entirely.
+#
+# --purge-all-packages: remove the FULL package list (vlc jq curl cron
+#                        logrotate qrencode imagemagick fonts-dejavu-core
+#                        nodejs npm) regardless of whether they pre-date
+#                        this install — for when you genuinely want them
+#                        gone either way.
 
 set -e
 
-PURGE_PACKAGES=false
-[ "$1" = "--purge-packages" ] && PURGE_PACKAGES=true
+PURGE_ALL_PACKAGES=false
+[ "$1" = "--purge-all-packages" ] && PURGE_ALL_PACKAGES=true
 
 # ── Figure out whose home directory this was installed into ──────────────────
 # Same detection install.sh uses — modern Raspberry Pi OS has no default "pi"
@@ -24,6 +32,11 @@ if [ -n "$PI_USER" ] && [ "$PI_USER" != "root" ]; then
   PI_HOME=$(getent passwd "$PI_USER" | cut -d: -f6)
 fi
 PI_HOME="${PI_HOME:-/home/pi}"
+
+# Read BEFORE anything below deletes the directory this file lives in — see
+# install.sh for how/why this is recorded. Missing entirely (an install from
+# before this file existed) just means "nothing to remove," the safe default.
+PACKAGES_ADDED_BY_INSTALL=$(cat "$PI_HOME/sitestream/.packages_added_by_install" 2>/dev/null || echo "")
 
 echo "=== SiteStream Pi Client Uninstall ==="
 echo "Target: $PI_HOME/sitestream"
@@ -52,6 +65,29 @@ rm -f /etc/systemd/system/sitestream-listen.service
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 
+# ── Stop and remove the standalone-mode local portal service ──────────────────
+if systemctl list-unit-files 2>/dev/null | grep -q '^sitestream-portal.service'; then
+  echo "Stopping sitestream-portal.service…"
+  systemctl stop sitestream-portal.service 2>/dev/null || true
+  systemctl disable sitestream-portal.service 2>/dev/null || true
+fi
+rm -f /etc/systemd/system/sitestream-portal.service
+systemctl daemon-reload
+systemctl reset-failed 2>/dev/null || true
+
+# ── Stop and remove the Wi-Fi ad-hoc setup fallback service ───────────────────
+if systemctl list-unit-files 2>/dev/null | grep -q '^sitestream-wifi-ap.service'; then
+  echo "Stopping sitestream-wifi-ap.service…"
+  systemctl stop sitestream-wifi-ap.service 2>/dev/null || true
+  systemctl disable sitestream-wifi-ap.service 2>/dev/null || true
+fi
+rm -f /etc/systemd/system/sitestream-wifi-ap.service
+systemctl daemon-reload
+systemctl reset-failed 2>/dev/null || true
+# In case a setup hotspot happened to be active — leaving it running after
+# uninstall would be a stray open Wi-Fi network broadcasting indefinitely.
+nmcli connection down SiteStream-Setup >/dev/null 2>&1 || true
+
 # listen.sh spawns sync.sh as a backgrounded child whenever it reacts to a
 # push (see trigger_sync() in listen.sh) — `systemctl stop` above only
 # signals the main listen.sh process (KillMode=process, same reasoning as
@@ -60,6 +96,26 @@ systemctl reset-failed 2>/dev/null || true
 # of those up directly rather than leaving them to finish into a directory
 # that's about to be deleted out from under them.
 pkill -f "sitestream/sync.sh" 2>/dev/null || true
+
+# ── Restore desktop boot mode ──────────────────────────────────────────────────
+# install.sh switches to Console Autologin + disables lightdm so VLC's own
+# DRM output isn't fighting a desktop session for the display plane. B4
+# (Desktop Autologin) is the stock Raspberry Pi OS default for basically every
+# general-purpose image — reasonable to restore unconditionally rather than
+# tracking whatever the prior setting was, same tradeoff already accepted for
+# the package list below.
+if command -v raspi-config >/dev/null 2>&1; then
+  raspi-config nonint do_boot_behaviour B4 || true
+fi
+systemctl enable lightdm 2>/dev/null || true
+
+# consoleblank=0 was appended as a single token to cmdline.txt by install.sh —
+# safe to remove as long as nothing else on the line depends on it (it never
+# takes a value, so there's nothing for a neighboring option to have merged
+# with).
+for candidate in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
+  [ -f "$candidate" ] && sed -i 's/ consoleblank=0//' "$candidate"
+done
 
 # ── Remove the Wi-Fi power-save-off unit ──────────────────────────────────────
 if systemctl list-unit-files 2>/dev/null | grep -q '^wifi-powersave-off.service'; then
@@ -91,14 +147,18 @@ rm -f /etc/logrotate.d/sitestream
 echo "Removing $PI_HOME/sitestream (config, cached videos, logs)…"
 rm -rf "$PI_HOME/sitestream"
 
-# ── Optionally remove packages install.sh installed ───────────────────────────
-if [ "$PURGE_PACKAGES" = true ]; then
-  echo "Removing packages: vlc jq curl cron logrotate qrencode imagemagick fonts-dejavu-core…"
-  apt-get remove -y -q vlc jq curl cron logrotate qrencode imagemagick fonts-dejavu-core
+# ── Remove packages — exactly what install.sh added, by default ───────────────
+if [ "$PURGE_ALL_PACKAGES" = true ]; then
+  echo "Removing packages: vlc jq curl cron logrotate qrencode imagemagick fonts-dejavu-core nodejs npm (forced, regardless of origin)…"
+  apt-get remove -y -q vlc jq curl cron logrotate qrencode imagemagick fonts-dejavu-core nodejs npm
+  apt-get autoremove -y -q
+elif [ -n "$PACKAGES_ADDED_BY_INSTALL" ]; then
+  echo "Removing packages install.sh added on this Pi:$PACKAGES_ADDED_BY_INSTALL…"
+  apt-get remove -y -q $PACKAGES_ADDED_BY_INSTALL
   apt-get autoremove -y -q
 else
-  echo "Leaving vlc/jq/curl/cron/logrotate/qrencode/imagemagick/fonts-dejavu-core installed"
-  echo "(common system utilities — pass --purge-packages to also remove them)."
+  echo "No packages to remove — everything install.sh depends on was already present before it ran"
+  echo "(or this install predates package tracking; pass --purge-all-packages to remove the full list anyway)."
 fi
 
 echo ""

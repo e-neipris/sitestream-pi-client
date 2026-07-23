@@ -112,16 +112,12 @@ extract_vlc_displayed_pictures() {
   echo "$1" | grep -o '<displayedpictures>[0-9]*</displayedpictures>' | grep -o '[0-9]*'
 }
 
-# Disable screen blanking/DPMS entirely — this is a kiosk display with no
-# keyboard/mouse ever attached, so X sees "no activity" forever and blanks
-# the screen on its default timeout regardless of whether a video should be
-# playing. A schedule-free gap (or just the normal gap between windows) would
-# otherwise leave the display asleep with nothing to wake it back up.
-disable_screen_blanking() {
-  DISPLAY=:0 xset s off 2>/dev/null || true
-  DISPLAY=:0 xset s noblank 2>/dev/null || true
-  DISPLAY=:0 xset -dpms 2>/dev/null || true
-}
+# Screen blanking is handled once, permanently, at the OS level — see
+# install.sh's consoleblank=0 kernel cmdline addition. This used to run
+# `xset` here instead, but that only ever worked because an X session was
+# running for it to talk to; VLC now renders straight to the display via its
+# own DRM/KMS output (see start_vlc), with no desktop session in the way at
+# all (lightdm is disabled — same install.sh change).
 
 # Multicast runs as a fully separate, headless VLC process from the display
 # one below — NOT combined via `--sout '#duplicate{dst=display,...}'` in a
@@ -149,11 +145,23 @@ start_multicast() {
   # guard below returns early, and the main loop's config-changed check keeps
   # re-triggering this function every tick forever, starving out the `else`
   # branch (the VLC stall/freeze watchdog) below it.
-  CURRENT_MULTICAST_TARGET="$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT"
+  CURRENT_MULTICAST_TARGET="$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT:$MULTICAST_INTERFACE"
   if [ "$MULTICAST_ENABLED" != "true" ] || [ -z "$MULTICAST_ADDRESS" ] || [ -z "$MULTICAST_PORT" ]; then
     return
   fi
-  log "Starting multicast output: udp://$MULTICAST_ADDRESS:$MULTICAST_PORT"
+  # --miface pins which NIC actually transmits the multicast packets,
+  # overriding whatever the kernel's own routing table would otherwise pick
+  # — needed the moment this device also uses a different interface (e.g.
+  # wlan0) for its own SaaS traffic, so multicast doesn't silently try to
+  # go out that one instead of the wired ingestion port. Confirmed against
+  # this VLC build via `cvlc --advanced --longhelp | grep -A4 miface`
+  # ("Multicast output interface") before wiring this in. Empty/unset
+  # (the common case) omits the flag entirely — same as before this existed.
+  MIFACE_ARGS=()
+  if [ -n "$MULTICAST_INTERFACE" ]; then
+    MIFACE_ARGS=(--miface "$MULTICAST_INTERFACE")
+  fi
+  log "Starting multicast output: udp://$MULTICAST_ADDRESS:$MULTICAST_PORT${MULTICAST_INTERFACE:+ via $MULTICAST_INTERFACE}"
   # No transcode{} stanza — this remuxes the existing H.264 MP4 into MPEG-TS
   # rather than re-encoding it, which is what sync.sh downloads today. Revisit
   # this once you have the tuner manufacturer's exact ingest spec.
@@ -173,6 +181,7 @@ start_multicast() {
     --vout dummy \
     --aout alsa \
     --loop \
+    "${MIFACE_ARGS[@]}" \
     --sout "#std{access=udp,mux=ts,dst=$MULTICAST_ADDRESS:$MULTICAST_PORT}" \
     --sout-keep \
     --extraintf logger \
@@ -198,10 +207,6 @@ start_vlc() {
   local video_path="$1"
   stop_vlc
   log "Starting VLC: $video_path"
-  # Force-wake in case the display already blanked before this run — the
-  # config change above only prevents future blanking, it won't undo a
-  # display that's already asleep from before player.sh (re)started.
-  DISPLAY=:0 xset dpms force on 2>/dev/null || true
 
   # --aout alsa: without this, VLC auto-probes and lands on PulseAudio, which
   # fails here ("PulseAudio server connection failure: Connection refused")
@@ -227,7 +232,7 @@ start_vlc() {
   # producing a visible flash/reload loop instead of a steady display. No
   # effect on an actual video file — that path never touches the image
   # demuxer at all.
-  DISPLAY=:0 vlc \
+  vlc \
     --intf dummy \
     --fullscreen \
     --loop \
@@ -282,7 +287,6 @@ get_current_video() {
 }
 
 log "SiteStream player started."
-disable_screen_blanking
 
 # Graceful shutdown on `systemctl stop`/`restart` — paired with KillMode=process
 # in the systemd unit (systemd then only signals this process directly, not
@@ -295,15 +299,7 @@ disable_screen_blanking
 trap 'log "Shutting down…"; stop_vlc; exit 0' TERM INT
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
-LOOP_COUNT=0
 while true; do
-  # Re-assert every ~10 min in case anything else (a package update, a
-  # desktop environment restart) re-enables blanking behind our backs.
-  if [ $((LOOP_COUNT % 20)) -eq 0 ]; then
-    disable_screen_blanking
-  fi
-  LOOP_COUNT=$((LOOP_COUNT + 1))
-
   # Re-read config each loop so a multicast toggle (or the token, if reissued)
   # takes effect without needing to restart this service.
   [ -f "$CONFIG" ] && source "$CONFIG"
