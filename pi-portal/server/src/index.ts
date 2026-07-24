@@ -29,6 +29,14 @@ async function start() {
     if (!request.url.startsWith('/api/')) return
     if (request.url.startsWith('/api/auth/')) return
     if (request.url === '/api/health') return
+    // POST /api/files/:id/raw-upload is this server's own same-origin
+    // stand-in for a genuine S3 presigned POST (see files.ts) — MediaPanel.tsx
+    // deliberately sends that step with no Authorization header, exactly as
+    // it would for a real presigned URL, so this blanket check can't apply
+    // here. The unguessable fileId embedded in the URL — handed out only by
+    // an already-authenticated initiate-upload call — is the credential,
+    // same as a presigned URL's signature.
+    if (request.method === 'POST' && /^\/api\/files\/[^/]+\/raw-upload$/.test(request.url)) return
     return requirePortalAuth(request, reply)
   })
 

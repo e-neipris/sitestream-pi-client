@@ -126,7 +126,22 @@ apply_sync_interval() {
   esac
 
   local new_cron_line="$cron_schedule $SITESTREAM_DIR/sync.sh >> $SITESTREAM_DIR/logs/sync.log 2>&1"
-  if (crontab -l 2>/dev/null | grep -v "sync.sh"; echo "$new_cron_line") | crontab -; then
+  # `|| true` after the grep matters: the existing crontab almost always
+  # already contains exactly this one sync.sh line (from the last time this
+  # ran, or from install.sh's own setup), so `grep -v` filters it out
+  # completely and exits 1 ("no lines selected") — the LAST command in this
+  # subshell, which inherits this script's own `set -e` (see top of file),
+  # so the subshell aborted right there and `echo "$new_cron_line"` below
+  # never ran. The (now empty) subshell output still piped into `crontab -`,
+  # which accepts empty input as "install a crontab with zero lines" instead
+  # of erroring — and since a pipeline's exit status is only the LAST
+  # command's, the `if` below saw success and logged "cron schedule
+  # updated" while actually leaving the crontab completely empty (nothing
+  # left to ever run sync.sh again). Confirmed against install.sh's
+  # identical pattern, which hit this for real on a live device. `|| true`
+  # keeps the subshell alive past the grep regardless of whether it matched
+  # anything, so `echo "$new_cron_line"` always runs.
+  if (crontab -l 2>/dev/null | grep -v "sync.sh" || true; echo "$new_cron_line") | crontab -; then
     echo "$minutes" > "$SYNC_INTERVAL_FILE"
     log "Sync interval changed to every ${minutes} min — cron schedule updated (takes effect next tick)."
   else
@@ -345,13 +360,50 @@ fi
 # otherwise run against a config.env/state that's already been wiped out from
 # under them. Exiting right after is deliberate, not just tidy.
 FACTORY_RESET_REQUESTED=$(echo "$MANIFEST" | jq -r '.factoryReset // false')
+# Separate opt-in flag, not implied by factoryReset alone — see
+# factory-reset.sh's own --forget-wifi usage comment for why this defaults
+# to leaving Wi-Fi credentials in place (a device that silently dropped off
+# its network on reset would be unreachable until someone got physical
+# access again). Admin-panel contract: a `factoryResetForgetWifi` boolean
+# alongside `factoryReset` in the same reset request — expected to appear as
+# a checkbox on that same confirmation screen, not a separate action.
+FACTORY_RESET_FORGET_WIFI=$(echo "$MANIFEST" | jq -r '.factoryResetForgetWifi // false')
 if [ "$FACTORY_RESET_REQUESTED" = "true" ]; then
   DEVICE_ID=$(echo "$MANIFEST" | jq -r '.deviceId')
   log "Factory reset requested via admin panel — acknowledging…"
   if curl -sf -X POST -H "Authorization: Bearer $DEVICE_TOKEN" --max-time 15 \
        "$API_URL/api/devices/$DEVICE_ID/factory-reset/ack" > /dev/null; then
     log "Acknowledged. Running factory reset now."
-    "$SITESTREAM_DIR/factory-reset.sh" --yes
+    FACTORY_RESET_ARGS=(--yes)
+    [ "$FACTORY_RESET_FORGET_WIFI" = "true" ] && FACTORY_RESET_ARGS+=(--forget-wifi)
+    "$SITESTREAM_DIR/factory-reset.sh" "${FACTORY_RESET_ARGS[@]}"
+    # Uses $DEVICE_TOKEN/$DEVICE_ID already loaded into this process's memory
+    # from the manifest fetch earlier in this same run — factory-reset.sh has
+    # by now wiped both out of config.env on disk, but that doesn't affect a
+    # shell variable already read before it ran. Tells the server the reset
+    # actually finished (not just started, like /ack above) — if an admin
+    # asked for this device to be released back to the unclaimed pool, this
+    # is what actually makes that happen, synchronously, before this device's
+    # own next cron tick could otherwise race it by checking in via serial
+    # and getting silently reissued a fresh token into the same zone.
+    curl -sf -X POST -H "Authorization: Bearer $DEVICE_TOKEN" --max-time 15 \
+         "$API_URL/api/devices/$DEVICE_ID/factory-reset/confirm" > /dev/null \
+      || log "WARN: could not confirm factory-reset completion to the API (device is still reset locally either way)."
+    # Reboot only for --forget-wifi, and only *after* the confirm call above —
+    # confirmed live that forgetting a Wi-Fi connection profile can leave
+    # NetworkManager's radio/device state stuck (no hotspot broadcasting, no
+    # rejoin) until a full reboot, not just a service restart. Deliberately
+    # NOT inside factory-reset.sh itself: that script also runs standalone
+    # (a human resetting a device by hand), and more importantly, a reboot
+    # triggered from inside it would race the confirm call above — if this
+    # process gets killed by the reboot before reaching that curl, an admin
+    # who asked to release this device would find it still sitting claimed,
+    # exactly the race releaseOnFactoryReset/confirm was built to prevent.
+    # Doing it here, last, keeps that guarantee intact.
+    if [ "$FACTORY_RESET_FORGET_WIFI" = "true" ]; then
+      log "Rebooting to fully clear networking state after --forget-wifi."
+      sudo -n systemctl reboot
+    fi
     exit 0
   else
     log "WARN: could not reach API to acknowledge factory reset — skipping this cycle, will retry."
@@ -498,6 +550,46 @@ if [ -n "$NET_INTERFACE" ] && [ -f /proc/net/wireless ] && grep -q "^ *${NET_INT
   fi
 fi
 
+# Reported (actual) system config — a read-only mirror of what's genuinely
+# set on this device right now, distinct from the timezone/hostname/wifiSsid
+# the manifest fetch above may have just PUSHED (see step 1's system-config
+# apply, if present) — those are "what an admin wants," not necessarily
+# "what's live yet." Lets the admin panel show real state instead of an
+# admin having to guess or open this device's own local System tab.
+CURRENT_TIMEZONE=$(timedatectl show --property=Timezone --value 2>/dev/null)
+CURRENT_HOSTNAME=$(hostname 2>/dev/null)
+CURRENT_WIFI_SSID=""
+if command -v nmcli >/dev/null 2>&1; then
+  CURRENT_WIFI_SSID=$(nmcli -t -f active,ssid dev wifi 2>/dev/null | awk -F: '$1=="yes" {print $2; exit}')
+fi
+
+# Physical network interfaces (name/type/MAC) — lets the admin panel offer a
+# real dropdown for e.g. the multicast output interface instead of an admin
+# having to guess what's actually there. Sourced from /sys/class/net
+# directly rather than nmcli/ip -j: works regardless of which of those is
+# installed, and every interface that matters here (onboard Ethernet, wlan0,
+# a USB Ethernet dongle) shows up there with no extra tooling. A wireless/
+# subdirectory's presence is the standard kernel-level way to tell Wi-Fi
+# apart from Ethernet without depending on driver-specific naming.
+NETWORK_INTERFACES_JSON="[]"
+if [ -d /sys/class/net ]; then
+  IFACE_ENTRIES=()
+  for ifacepath in /sys/class/net/*; do
+    iface=$(basename "$ifacepath")
+    case "$iface" in
+      lo|veth*|docker*|br-*|tun*|tap*) continue ;;
+    esac
+    iface_type="ethernet"
+    [ -d "$ifacepath/wireless" ] && iface_type="wifi"
+    mac=$(cat "$ifacepath/address" 2>/dev/null || echo "")
+    IFACE_ENTRIES+=("$(jq -n --arg name "$iface" --arg type "$iface_type" --arg mac "$mac" \
+      '{name: $name, type: $type} + (if $mac == "" then {} else {macAddress: $mac} end)')")
+  done
+  if [ "${#IFACE_ENTRIES[@]}" -gt 0 ]; then
+    NETWORK_INTERFACES_JSON=$(printf '%s\n' "${IFACE_ENTRIES[@]}" | jq -s '.')
+  fi
+fi
+
 # player.sh writes its live state here every ~30s (see write_status in
 # player.sh) — player.sh has no network access of its own by design, so
 # sync.sh is what actually reports it upstream.
@@ -529,7 +621,11 @@ HEARTBEAT_PAYLOAD=$(jq -n \
   --arg networkInterface "$NET_INTERFACE" \
   --arg wifiSignalPercent "$WIFI_SIGNAL_PCT" \
   --arg uptimeSeconds "$UPTIME_SECONDS" \
-  '{confirmedManifestHash: $confirmedManifestHash, ipAddress: $ipAddress}
+  --arg reportedTimezone "$CURRENT_TIMEZONE" \
+  --arg reportedHostname "$CURRENT_HOSTNAME" \
+  --arg reportedWifiSsid "$CURRENT_WIFI_SSID" \
+  --argjson networkInterfaces "$NETWORK_INTERFACES_JSON" \
+  '{confirmedManifestHash: $confirmedManifestHash, ipAddress: $ipAddress, networkInterfaces: $networkInterfaces}
   + (if $installedVersion == "" then {} else {installedVersion: $installedVersion} end)
   + (if $currentVideoFilename == "" then {} else {currentVideoFilename: $currentVideoFilename} end)
   + (if $lastVideoError == "" then {} else {lastVideoError: $lastVideoError} end)
@@ -542,6 +638,9 @@ HEARTBEAT_PAYLOAD=$(jq -n \
   + (if $networkInterface == "" then {} else {networkInterface: $networkInterface} end)
   + (if $wifiSignalPercent == "" then {} else {wifiSignalPercent: ($wifiSignalPercent | tonumber)} end)
   + (if $uptimeSeconds == "" then {} else {uptimeSeconds: ($uptimeSeconds | tonumber)} end)
+  + (if $reportedTimezone == "" then {} else {reportedTimezone: $reportedTimezone} end)
+  + (if $reportedHostname == "" then {} else {reportedHostname: $reportedHostname} end)
+  + (if $reportedWifiSsid == "" then {} else {reportedWifiSsid: $reportedWifiSsid} end)
   ')
 
 curl -sf \

@@ -5,7 +5,7 @@ import { promisify } from 'util'
 import fs from 'fs'
 import os from 'os'
 import path from 'path'
-import { SITESTREAM_DIR, getApiUrl, getAppUrl } from '../paths'
+import { SITESTREAM_DIR, CONFIG_FILE, getApiUrl, getAppUrl, parseConfigEnv } from '../paths'
 
 const exec = promisify(execCb)
 const execFile = promisify(execFileCb)
@@ -175,6 +175,59 @@ async function getWifiStatus(): Promise<WifiStatus> {
   }
 }
 
+export interface MulticastConfig {
+  enabled: boolean
+  address: string | null
+  port: number | null
+  interface: string | null
+}
+
+// Same MULTICAST_* keys, same config.env, as sync.sh's cloud-driven path
+// (see sync.sh's "Persist multicast output config for player.sh to pick
+// up") — player.sh doesn't know or care which side wrote them, it just
+// re-sources config.env every ~30s (see its main loop) and reacts to
+// whatever it finds. This is what gives a standalone, never-claimed device
+// the same multicast output the cloud already offers a claimed one.
+function getMulticastConfig(): MulticastConfig {
+  const cfg = parseConfigEnv()
+  return {
+    enabled: cfg.MULTICAST_ENABLED === 'true',
+    address: cfg.MULTICAST_ADDRESS || null,
+    port: cfg.MULTICAST_PORT ? Number(cfg.MULTICAST_PORT) : null,
+    interface: cfg.MULTICAST_INTERFACE || null,
+  }
+}
+
+// Rewrites only the MULTICAST_* lines, in place — every other key already in
+// config.env (APP_URL/API_URL/VIDEO_DIR/LOG_FILE, and DEVICE_TOKEN once
+// claimed) passes through untouched, same strip-then-append shape as
+// sync.sh's own rewrite of these same four keys.
+function writeMulticastConfig(config: MulticastConfig): void {
+  const existingLines = fs.existsSync(CONFIG_FILE) ? fs.readFileSync(CONFIG_FILE, 'utf8').split('\n') : []
+  const kept = existingLines.filter((line) => !/^(MULTICAST_ENABLED|MULTICAST_ADDRESS|MULTICAST_PORT|MULTICAST_INTERFACE)=/.test(line))
+  while (kept.length && kept[kept.length - 1] === '') kept.pop()
+
+  const next = [
+    ...kept,
+    `MULTICAST_ENABLED=${config.enabled}`,
+    `MULTICAST_ADDRESS=${config.address ?? ''}`,
+    `MULTICAST_PORT=${config.port ?? ''}`,
+    `MULTICAST_INTERFACE=${config.interface ?? ''}`,
+  ].join('\n') + '\n'
+
+  fs.writeFileSync(CONFIG_FILE, next, { mode: 0o600 })
+}
+
+// Lists real NICs for the multicast interface dropdown (see MULTICAST_INTERFACE
+// / player.sh's --miface) — loopback and anything with no live address (down,
+// unplugged) filtered out, since neither is a sane multicast egress choice.
+function listNetworkInterfaces(): string[] {
+  const nets = os.networkInterfaces()
+  return Object.entries(nets)
+    .filter(([name, addrs]) => name !== 'lo' && addrs?.some((a) => !a.internal))
+    .map(([name]) => name)
+}
+
 async function scanWifi(): Promise<{ ssid: string; signal: number }[]> {
   if (await isWifiRadioBlocked()) {
     throw new Error('WIFI_BLOCKED')
@@ -260,6 +313,7 @@ export default async function systemRoutes(app: FastifyInstance) {
       installedVersion,
       wifiBlocked: await isWifiRadioBlocked(),
       wifi: await getWifiStatus(),
+      multicast: getMulticastConfig(),
     }
   })
 
@@ -370,6 +424,35 @@ export default async function systemRoutes(app: FastifyInstance) {
   })
 
   /**
+   * Deletes any existing NetworkManager connection profile(s) matching this
+   * SSID before (re)joining it. Needed because `raspi-config nonint
+   * do_wifi_ssid_passphrase` — and the `nmcli device wifi connect` it uses
+   * under the hood on Bookworm/Trixie — reuses an existing profile by SSID
+   * name rather than overwriting its stored password: confirmed live that a
+   * network typed in with a fresh password kept failing when a prior
+   * attempt (e.g. one submitted with a blank password) had already created
+   * a broken profile of the same name — the new password was silently
+   * never applied, and the same broken profile just got reactivated every
+   * time. Best-effort: a device joining this SSID for the first time has
+   * nothing to delete, so a "no such connection" failure here is expected,
+   * not logged as an error.
+   */
+  async function forgetExistingProfile(ssid: string): Promise<void> {
+    try {
+      const { stdout } = await exec('nmcli -t -f NAME,TYPE connection show 2>/dev/null')
+      const names = stdout.split('\n')
+        .map((line) => line.split(':'))
+        .filter(([name, type]) => name === ssid && type === '802-11-wireless')
+        .map(([name]) => name)
+      for (const name of names) {
+        await execFile('sudo', ['-n', 'nmcli', 'connection', 'delete', name]).catch(() => {})
+      }
+    } catch {
+      // nmcli not present/usable — nothing to clean up, do_wifi_ssid_passphrase below is a no-op too.
+    }
+  }
+
+  /**
    * POST /api/system/wifi/connect — raspi-config's nonint helper handles
    * both networking backends (dhcpcd+wpa_supplicant on Bullseye,
    * NetworkManager on Bookworm/Trixie) itself, so this doesn't need its own
@@ -391,11 +474,48 @@ export default async function systemRoutes(app: FastifyInstance) {
       if (body.data.countryCode) {
         await execFile('sudo', ['-n', 'raspi-config', 'nonint', 'do_wifi_country', body.data.countryCode.toUpperCase()])
       }
+      await forgetExistingProfile(body.data.ssid)
       await execFile('sudo', ['-n', 'raspi-config', 'nonint', 'do_wifi_ssid_passphrase', body.data.ssid, body.data.password ?? ''])
       return { ok: true }
     } catch (err) {
       logExecFailure(request.log, 'POST /wifi/connect', err)
       return reply.code(500).send({ error: 'Could not join that network — check the password and try again.' })
+    }
+  })
+
+  /** GET /api/system/network-interfaces — populates the multicast interface picker */
+  app.get('/network-interfaces', async () => listNetworkInterfaces())
+
+  /**
+   * POST /api/system/multicast — the standalone-mode equivalent of the
+   * cloud's per-device multicast fields (see the SaaS web app's
+   * EditDeviceModal). Writes the same MULTICAST_* config.env keys sync.sh's
+   * self-update path writes; player.sh already re-sources config.env every
+   * ~30s and reacts to a change on its own (see its start_multicast), so
+   * this needs no restart/reload of anything to take effect.
+   */
+  app.post('/multicast', async (request, reply) => {
+    const body = z.object({
+      enabled: z.boolean(),
+      address: z.string().min(1).optional(),
+      port: z.number().int().min(1).max(65535).optional(),
+      interface: z.string().optional(),
+    }).refine((v) => !v.enabled || (v.address && v.port), {
+      message: 'Address and port are required when multicast is enabled',
+    }).safeParse(request.body)
+    if (!body.success) return reply.code(400).send({ error: body.error.flatten() })
+
+    try {
+      writeMulticastConfig({
+        enabled: body.data.enabled,
+        address: body.data.address ?? null,
+        port: body.data.port ?? null,
+        interface: body.data.interface ?? null,
+      })
+      return { ok: true }
+    } catch (err) {
+      logExecFailure(request.log, 'POST /multicast', err)
+      return reply.code(500).send({ error: 'Could not save multicast settings' })
     }
   })
 

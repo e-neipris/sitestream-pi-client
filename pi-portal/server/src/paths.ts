@@ -13,8 +13,14 @@ export const SCHEDULE_FILE = path.join(SITESTREAM_DIR, 'schedule.json')
 export const CONFIG_FILE = path.join(SITESTREAM_DIR, 'config.env')
 export const DB_FILE = path.join(SITESTREAM_DIR, 'pi-portal.sqlite3')
 
-/** Minimal KEY=VALUE parser matching config.env's own format (no quoting, one per line). */
-function parseConfigEnv(): Record<string, string> {
+/**
+ * Minimal KEY=VALUE parser matching config.env's own format (no quoting, one
+ * per line). Exported — system.ts's multicast routes read the same
+ * MULTICAST_* keys sync.sh's cloud-driven path writes (see sync.sh's own
+ * "Persist multicast output config for player.sh to pick up"), so this
+ * reuses the one parser instead of a second copy of the same regex.
+ */
+export function parseConfigEnv(): Record<string, string> {
   if (!fs.existsSync(CONFIG_FILE)) return {}
   const out: Record<string, string> = {}
   for (const line of fs.readFileSync(CONFIG_FILE, 'utf8').split('\n')) {

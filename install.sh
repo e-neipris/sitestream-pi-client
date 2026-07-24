@@ -168,6 +168,7 @@ if [ "$SCRIPT_DIR" != "$PI_HOME/sitestream" ]; then
   cp "$SCRIPT_DIR/listen.sh"                       "$PI_HOME/sitestream/listen.sh"
   cp "$SCRIPT_DIR/generate-onboarding-screen.sh"  "$PI_HOME/sitestream/generate-onboarding-screen.sh"
   cp "$SCRIPT_DIR/generate-idle-screen.sh"        "$PI_HOME/sitestream/generate-idle-screen.sh"
+  cp "$SCRIPT_DIR/generate-wifi-rescue-screen.sh" "$PI_HOME/sitestream/generate-wifi-rescue-screen.sh"
   cp "$SCRIPT_DIR/factory-reset.sh"               "$PI_HOME/sitestream/factory-reset.sh"
   cp "$SCRIPT_DIR/wifi-ap-fallback.sh"            "$PI_HOME/sitestream/wifi-ap-fallback.sh"
   cp "$SCRIPT_DIR/install.sh"                     "$PI_HOME/sitestream/install.sh"
@@ -177,6 +178,7 @@ chmod +x "$PI_HOME/sitestream/player.sh"
 chmod +x "$PI_HOME/sitestream/listen.sh"
 chmod +x "$PI_HOME/sitestream/generate-onboarding-screen.sh"
 chmod +x "$PI_HOME/sitestream/generate-idle-screen.sh"
+chmod +x "$PI_HOME/sitestream/generate-wifi-rescue-screen.sh"
 chmod +x "$PI_HOME/sitestream/factory-reset.sh"
 chmod +x "$PI_HOME/sitestream/wifi-ap-fallback.sh"
 chmod +x "$PI_HOME/sitestream/install.sh"
@@ -220,6 +222,36 @@ else
   echo "WARN: pi-portal/ not found next to install.sh — skipping standalone-mode local portal setup."
 fi
 
+# ── Installed version stamp ────────────────────────────────────────────────
+# .installed_version (read by the portal's System tab and sync.sh's own
+# update check — see paths.ts / sync.sh) used to only ever get written by
+# TWO places: sync.sh's self-update, and the portal's own firmware-upload
+# handler (which stamps whatever filename was uploaded). A plain first
+# install running this script directly never wrote it at all, so a fresh
+# device showed "unknown" forever until one of those two paths happened to
+# run. VERSION ships alongside install.sh in the release tarball — stamp it
+# here so every install path, including a fresh one, ends up with a correct
+# version on disk from the start.
+#
+# Skipped entirely on a self-update re-invocation (same SCRIPT_DIR-equals-
+# destination check used above for the script/pi-portal copy blocks, same
+# reasoning): sync.sh has ALREADY written the correct value to
+# .installed_version — the manifest's authoritative target version straight
+# from the fleet's release catalog — a few lines before it re-runs this
+# script. This block used to run unconditionally afterward and stamp
+# whatever this tarball's OWN bundled VERSION file says instead, which is
+# only guaranteed to match if whoever uploaded the release to the SaaS typed
+# the exact same string into its version label. Confirmed live: it didn't
+# (tarball's VERSION said "1.50", the catalog entry was labeled "1.5"), so
+# this silently overwrote sync.sh's correct write right back to "1.50" every
+# single cycle — permanently masking the version bump and looping the same
+# reinstall forever. A genuine fresh/manual install (SCRIPT_DIR actually
+# different from the destination) still needs this — nothing else has
+# written .installed_version yet in that case.
+if [ -f "$SCRIPT_DIR/VERSION" ] && [ "$SCRIPT_DIR" != "$PI_HOME/sitestream" ]; then
+  cp "$SCRIPT_DIR/VERSION" "$PI_HOME/sitestream/.installed_version"
+fi
+
 chown -R "$PI_USER:$PI_GROUP" "$PI_HOME/sitestream"
 
 # ── Log rotation ───────────────────────────────────────────────────────────────
@@ -259,7 +291,22 @@ EOF
 # path to root if sync.sh were ever compromised.
 rm -f /etc/cron.d/sitestream-sync  # clean up the old mechanism, in case install.sh is being re-run
 CRON_LINE="* * * * * $PI_HOME/sitestream/sync.sh >> $PI_HOME/sitestream/logs/sync.log 2>&1"
-(crontab -u "$PI_USER" -l 2>/dev/null | grep -v "sitestream/sync.sh"; echo "$CRON_LINE") | crontab -u "$PI_USER" -
+# `|| true` after the grep matters more than it looks: on every re-run after
+# the first (i.e. basically always), the existing crontab already contains
+# exactly this one sync.sh line, so `grep -v` filters it out completely and
+# exits 1 ("no lines selected") — that's the LAST command in this subshell,
+# which inherits `set -e` from the rest of this script, so the subshell
+# aborted right there and `echo "$CRON_LINE"` below never ran. The (now
+# empty) subshell output still got piped into `crontab -u "$PI_USER" -`,
+# which accepts empty input as "install a crontab with zero lines" rather
+# than erroring — and since a pipeline's exit status is only the LAST
+# command's (crontab's, which "succeeded"), this failure was completely
+# silent: install.sh reported success while quietly wiping the cron job that
+# makes sync.sh (and the whole check-in/update loop) run at all. Confirmed
+# live: this is what stopped this exact device from syncing after a routine
+# reinstall. `|| true` keeps the subshell alive past the grep regardless of
+# whether it matched anything, so `echo "$CRON_LINE"` always runs.
+(crontab -u "$PI_USER" -l 2>/dev/null | grep -v "sitestream/sync.sh" || true; echo "$CRON_LINE") | crontab -u "$PI_USER" -
 # sync.sh caches the interval it last wrote to crontab (.sync_interval) so it
 # doesn't rewrite crontab on every single run — only when the target value
 # actually changes. That cache has no way to know we just reset crontab out
@@ -514,6 +561,9 @@ $PI_USER ALL=(root) NOPASSWD: $HOSTNAMECTL_BIN set-hostname *
 $PI_USER ALL=(root) NOPASSWD: $IW_BIN_FOR_SUDOERS dev * scan
 $PI_USER ALL=(root) NOPASSWD: $NMCLI_BIN device wifi hotspot *
 $PI_USER ALL=(root) NOPASSWD: $NMCLI_BIN connection down *
+$PI_USER ALL=(root) NOPASSWD: $NMCLI_BIN connection delete *
+$PI_USER ALL=(root) NOPASSWD: $NMCLI_BIN connection up *
+$PI_USER ALL=(root) NOPASSWD: $NMCLI_BIN connection modify *
 $PI_USER ALL=(root) NOPASSWD: $NMCLI_BIN radio wifi on
 EOF
 chmod 440 /etc/sudoers.d/sitestream

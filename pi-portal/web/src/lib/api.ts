@@ -108,6 +108,7 @@ export interface SystemInfo {
   // join anything at all until it is. See system.ts's isWifiRadioBlocked.
   wifiBlocked: boolean
   wifi: WifiStatus
+  multicast: MulticastConfig
 }
 
 export interface WifiStatus {
@@ -123,6 +124,16 @@ export interface WifiNetwork {
   signal: number
 }
 
+// Standalone-mode equivalent of the cloud's per-device multicast fields (see
+// the SaaS web app's EditDeviceModal) — same shape, same MULTICAST_* keys
+// underneath (see system.ts's getMulticastConfig).
+export interface MulticastConfig {
+  enabled: boolean
+  address: string | null
+  port: number | null
+  interface: string | null
+}
+
 export const systemApi = {
   info: () => api.get<SystemInfo>('/system/info'),
   timezones: () => api.get<string[]>('/system/timezones'),
@@ -134,6 +145,9 @@ export const systemApi = {
   setWifiCountry: (countryCode: string) => api.post<{ ok: boolean }>('/system/wifi/country', { countryCode }),
   connectWifi: (data: { ssid: string; password?: string; countryCode?: string }) =>
     api.post<{ ok: boolean }>('/system/wifi/connect', data),
+  networkInterfaces: () => api.get<string[]>('/system/network-interfaces'),
+  setMulticast: (data: { enabled: boolean; address?: string; port?: number; interface?: string }) =>
+    api.post<{ ok: boolean }>('/system/multicast', data),
   uploadFirmware: (file: File) => {
     const formData = new FormData()
     formData.append('file', file)

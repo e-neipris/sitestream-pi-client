@@ -84,6 +84,41 @@ function SettingsView() {
     onError: (err: any) => setError(apiErrorMessage(err, 'Could not join that network')),
   })
 
+  const { data: networkInterfaces } = useQuery({
+    queryKey: ['network-interfaces'],
+    queryFn: () => systemApi.networkInterfaces().then((r) => r.data),
+  })
+
+  // Seeded once via a ref (not the `!multicastEnabled` pattern used for
+  // timezone/hostname above) — `enabled: false` is a legitimate saved state,
+  // and that guard would re-clobber it from a stale `info` on every 15s
+  // refetch, right in the middle of someone editing these fields.
+  const multicastSeeded = useRef(false)
+  const [multicastEnabled, setMulticastEnabled] = useState(false)
+  const [multicastAddress, setMulticastAddress] = useState('')
+  const [multicastPort, setMulticastPort] = useState('')
+  const [multicastInterface, setMulticastInterface] = useState('')
+  useEffect(() => {
+    if (info?.multicast && !multicastSeeded.current) {
+      multicastSeeded.current = true
+      setMulticastEnabled(info.multicast.enabled)
+      setMulticastAddress(info.multicast.address ?? '')
+      setMulticastPort(info.multicast.port?.toString() ?? '')
+      setMulticastInterface(info.multicast.interface ?? '')
+    }
+  }, [info?.multicast])
+
+  const setMulticastMut = useMutation({
+    mutationFn: () => systemApi.setMulticast({
+      enabled: multicastEnabled,
+      address: multicastEnabled ? multicastAddress.trim() : undefined,
+      port: multicastEnabled ? Number(multicastPort) : undefined,
+      interface: multicastEnabled ? (multicastInterface || undefined) : undefined,
+    }),
+    onSuccess: () => { setNotice('Multicast settings saved — player.sh picks this up within ~30s, no restart needed.'); invalidateInfo() },
+    onError: (err: any) => setError(apiErrorMessage(err, 'Could not save multicast settings')),
+  })
+
   const fileRef = useRef<HTMLInputElement>(null)
   const [uploading, setUploading] = useState(false)
   const handleFirmwareUpload = async (e: React.FormEvent) => {
@@ -185,7 +220,16 @@ function SettingsView() {
                 Country Code (optional, e.g. US)
                 <input style={{ ...input, textTransform: 'uppercase' }} maxLength={2} value={countryCode} onChange={(e) => setCountryCode(e.target.value)} />
               </label>
-              <button type="button" style={btn} disabled={!ssid || connectWifiMut.isPending} onClick={() => connectWifiMut.mutate()}>
+              <button
+                type="button" style={btn} disabled={!ssid || connectWifiMut.isPending}
+                onClick={() => {
+                  if (!wifiPassword && !window.confirm(
+                    `No password entered — this will join "${ssid}" as an OPEN network. If "${ssid}" actually requires a ` +
+                    'password, this will silently fail to connect (and won\'t reconnect on its own). Continue with no password?',
+                  )) return
+                  connectWifiMut.mutate()
+                }}
+              >
                 {connectWifiMut.isPending ? 'Joining…' : 'Join Network'}
               </button>
             </div>
@@ -206,6 +250,61 @@ function SettingsView() {
             </div>
           </div>
         </div>
+      </div>
+
+      <div style={card}>
+        <h2 style={h2}>Multicast</h2>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: '#e2e8f0', marginBottom: 12, cursor: 'pointer' }}>
+          <input type="checkbox" checked={multicastEnabled} onChange={(e) => setMulticastEnabled(e.target.checked)} />
+          Also output via multicast (in addition to HDMI) — for feeding an IPTV tuner
+        </label>
+        {multicastEnabled && (
+          <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 12, maxWidth: 520, marginBottom: 12 }}>
+            <label style={label}>
+              Multicast Address
+              <input
+                style={{ ...input, fontFamily: 'monospace' }}
+                value={multicastAddress}
+                onChange={(e) => setMulticastAddress(e.target.value)}
+                placeholder="e.g. 239.1.1.1"
+              />
+            </label>
+            <label style={label}>
+              Port
+              <input
+                style={{ ...input, fontFamily: 'monospace' }}
+                type="number"
+                min={1}
+                max={65535}
+                value={multicastPort}
+                onChange={(e) => setMulticastPort(e.target.value)}
+                placeholder="5004"
+              />
+            </label>
+            <label style={{ ...label, gridColumn: '1 / -1' }}>
+              Output Interface (optional)
+              <select
+                style={input}
+                value={multicastInterface}
+                onChange={(e) => setMulticastInterface(e.target.value)}
+              >
+                <option value="">Auto (let the OS decide)</option>
+                {networkInterfaces?.map((iface) => <option key={iface} value={iface}>{iface}</option>)}
+              </select>
+              <span style={{ color: '#475569', fontSize: 11 }}>
+                Only needed if this device also uses Wi-Fi for its own SaaS traffic — pins the multicast stream to
+                this specific NIC (e.g. the wired port feeding an IPTV tuner) instead of leaving it to the OS.
+              </span>
+            </label>
+          </div>
+        )}
+        <button
+          type="button" style={btn}
+          disabled={setMulticastMut.isPending || (multicastEnabled && (!multicastAddress.trim() || !multicastPort))}
+          onClick={() => setMulticastMut.mutate()}
+        >
+          {setMulticastMut.isPending ? 'Saving…' : 'Save Multicast Settings'}
+        </button>
       </div>
 
       <div style={card}>

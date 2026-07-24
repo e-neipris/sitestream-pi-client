@@ -47,9 +47,40 @@ signal_urgent_health() {
 
 # Most recent ERROR-level line from vlc.log, if any — cheap enough to tail
 # every loop tick given vlc.log is capped by logrotate.
+#
+# BENIGN_VOUT_LINES below are specific, confirmed-harmless lines from VLC's
+# video-output startup. Most of this noise is now prevented at the source —
+# start_vlc forces --vout drm_vout so VLC never auto-probes (and rejects)
+# backends like xcb that were never going to work on this headless-DRM setup
+# (no X server — lightdm is disabled, see install.sh) — so this list should
+# stay short: only drm_vout's own internal connection-strategy fallbacks
+# remain (atomic-vs-legacy KMS, lease-vs-direct-master), a small, already
+# largely-enumerated set specific to that one module, not an open-ended
+# category. The xcb line stays listed anyway as a safety net in case some
+# code path still touches it despite the forced module. This is a whitelist
+# of exact known-benign lines, not a blanket match on module name — a
+# *different* error from any of these modules could still be real, so don't
+# widen this past exact strings. Add new confirmed-benign lines here only
+# after confirming (not assuming) playback actually continued normally:
+#   - "drm_vout error: Failed to set atomic cap": the *previous* VLC process
+#     (typically the onboarding-screen image) hasn't fully released the DRM
+#     device yet when this new one starts — almost always right at the
+#     onboarding-screen -> first-real-video transition on a freshly claimed
+#     device.
+#   - "drm_vout error: Failed to get xlease": tries to lease DRM access from
+#     an X server first (the polite way to share DRM when a compositor owns
+#     it); there's no X server running at all here, so this always fails
+#     before falling through to direct DRM master access.
+#   - "xcb error: window not available": VLC auto-probing the X11 backend
+#     before reaching drm_vout — should no longer occur at all now that the
+#     vout module is forced explicitly; kept as a safety net regardless.
+BENIGN_VOUT_LINES='drm_vout error: Failed to set atomic cap|drm_vout error: Failed to get xlease|xcb error: window not available'
 get_last_vlc_error() {
   [ -f "$SITESTREAM_DIR/logs/vlc.log" ] || return
-  tail -n 50 "$SITESTREAM_DIR/logs/vlc.log" 2>/dev/null | grep -i 'error:' | tail -1
+  tail -n 50 "$SITESTREAM_DIR/logs/vlc.log" 2>/dev/null \
+    | grep -i 'error:' \
+    | grep -vE "$BENIGN_VOUT_LINES" \
+    | tail -1
 }
 
 # Written every loop tick so sync.sh can fold live playback state into its
@@ -231,6 +262,19 @@ start_vlc() {
   stop_vlc
   log "Starting VLC: $video_path"
 
+  # --vout drm_vout: without this, VLC auto-probes video-output backends in
+  # priority order — xcb (X11) first, among others — before ever reaching
+  # drm_vout, the one that actually works on this headless-DRM setup (no X
+  # server; lightdm is disabled). Every backend it tries and rejects along
+  # the way logs its own "error:" line (confirmed: "xcb error: window not
+  # available" was VLC trying the X11 backend that was never going to work
+  # here, not a real problem), which get_last_vlc_error below then surfaces
+  # as a device health issue on a device that was never actually broken.
+  # Forcing the module VLC was always going to land on anyway skips that
+  # whole probe-and-reject sequence rather than reactively whitelisting each
+  # backend's rejection message as it's discovered — see BENIGN_VOUT_LINES
+  # below for the (much narrower, and not expected to keep growing) set of
+  # messages drm_vout can still log internally even with this set.
   # --aout alsa: without this, VLC auto-probes and lands on PulseAudio, which
   # fails here ("PulseAudio server connection failure: Connection refused")
   # since this runs as a systemd system service with no desktop session for
@@ -257,6 +301,7 @@ start_vlc() {
   # demuxer at all.
   vlc \
     --intf dummy \
+    --vout drm_vout \
     --fullscreen \
     --loop \
     --image-duration -1 \
@@ -329,24 +374,49 @@ while true; do
   # takes effect without needing to restart this service.
   [ -f "$CONFIG" ] && source "$CONFIG"
 
-  # Not yet claimed — show the onboarding screen (serial + QR code) instead
-  # of the normal schedule logic below, entirely bypassing it. Generating is
-  # idempotent/cheap (skips if it already exists — see
-  # generate-onboarding-screen.sh), so it's simplest to just call it every
-  # tick rather than tracking whether it's already been done. The moment
-  # sync.sh claims this device and writes a real DEVICE_TOKEN into
-  # config.env, the very next loop tick (re-sourced above) sees that and
-  # falls through to normal playback on its own — no separate transition
-  # logic needed.
-  if [ -z "$DEVICE_TOKEN" ]; then
-    "$SITESTREAM_DIR/generate-onboarding-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
-    ONBOARDING_IMAGE="$SITESTREAM_DIR/onboarding.png"
-    if [ -f "$ONBOARDING_IMAGE" ]; then
-      ONBOARDING_MTIME=$(get_mtime "$ONBOARDING_IMAGE")
-      if [ "$CURRENT_VIDEO_PATH" != "$ONBOARDING_IMAGE" ] || [ "$ONBOARDING_MTIME" != "$CURRENT_STATIC_IMAGE_MTIME" ] || ! kill -0 "$VLC_PID" 2>/dev/null; then
-        log "Not yet claimed — showing onboarding screen (serial + QR code)."
-        start_vlc "$ONBOARDING_IMAGE" no-multicast
-        CURRENT_STATIC_IMAGE_MTIME="$ONBOARDING_MTIME"
+  # Not yet claimed AND nothing configured locally either — show the
+  # onboarding screen (serial + QR code) instead of the normal schedule logic
+  # below, entirely bypassing it. Generating is idempotent/cheap (skips if it
+  # already exists — see generate-onboarding-screen.sh), so it's simplest to
+  # just call it every tick rather than tracking whether it's already been
+  # done. The moment sync.sh claims this device and writes a real
+  # DEVICE_TOKEN into config.env, the very next loop tick (re-sourced above)
+  # sees that and falls through to normal playback on its own — no separate
+  # transition logic needed.
+  #
+  # The schedule.json check matters just as much as DEVICE_TOKEN: the
+  # standalone-mode local portal (pi-portal/) lets someone build a schedule
+  # entirely offline, with no cloud claim at all (see its own
+  # regenerateScheduleFile, called the moment a schedule is created). Without
+  # this check, this branch's unconditional `continue` meant an unclaimed
+  # device NEVER reached get_current_video() below no matter what was
+  # configured locally — the onboarding screen won permanently, and a
+  # standalone device's uploaded video + schedule silently never played.
+  if [ -z "$DEVICE_TOKEN" ] && [ ! -f "$SCHEDULE_FILE" ]; then
+    # A saved Wi-Fi profile that can't actually connect (wrong/changed
+    # password, moved site, ...) takes priority over the normal claim-QR
+    # onboarding screen here — see wifi-ap-fallback.sh's "rescue mode" for
+    # what writes/clears .wifi_rescue_state. Pointing someone at a claim URL
+    # is useless anyway in this state: there's no network route out of this
+    # device at all until the Wi-Fi problem is fixed.
+    SCREEN_IMAGE=""
+    if [ -f "$SITESTREAM_DIR/.wifi_rescue_state" ]; then
+      "$SITESTREAM_DIR/generate-wifi-rescue-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
+      [ -f "$SITESTREAM_DIR/wifi-rescue.png" ] && SCREEN_IMAGE="$SITESTREAM_DIR/wifi-rescue.png"
+    fi
+    if [ -n "$SCREEN_IMAGE" ]; then
+      SCREEN_LOG_MSG="Configured Wi-Fi network can't connect — showing rescue screen (hotspot + retry info)."
+    else
+      "$SITESTREAM_DIR/generate-onboarding-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
+      SCREEN_IMAGE="$SITESTREAM_DIR/onboarding.png"
+      SCREEN_LOG_MSG="Not yet claimed — showing onboarding screen (serial + QR code)."
+    fi
+    if [ -f "$SCREEN_IMAGE" ]; then
+      SCREEN_MTIME=$(get_mtime "$SCREEN_IMAGE")
+      if [ "$CURRENT_VIDEO_PATH" != "$SCREEN_IMAGE" ] || [ "$SCREEN_MTIME" != "$CURRENT_STATIC_IMAGE_MTIME" ] || ! kill -0 "$VLC_PID" 2>/dev/null; then
+        log "$SCREEN_LOG_MSG"
+        start_vlc "$SCREEN_IMAGE" no-multicast
+        CURRENT_STATIC_IMAGE_MTIME="$SCREEN_MTIME"
       fi
     fi
     write_status
@@ -361,13 +431,27 @@ while true; do
     # manage this device) instead of leaving the display blank. Same
     # idempotent-regeneration approach as the onboarding screen above: cheap
     # to call every tick, only actually rewrites the PNG when something
-    # relevant (this device's IP) has changed.
-    "$SITESTREAM_DIR/generate-idle-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
-    IDLE_IMAGE="$SITESTREAM_DIR/idle.png"
+    # relevant (this device's IP) has changed. Rescue-mode takes priority
+    # here too, same as the onboarding branch above — a claimed device with
+    # nothing currently scheduled and unreachable Wi-Fi should tell whoever's
+    # looking at the screen how to fix it, not just show the generic
+    # "nothing scheduled" idle screen.
+    IDLE_IMAGE=""
+    if [ -f "$SITESTREAM_DIR/.wifi_rescue_state" ]; then
+      "$SITESTREAM_DIR/generate-wifi-rescue-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
+      [ -f "$SITESTREAM_DIR/wifi-rescue.png" ] && IDLE_IMAGE="$SITESTREAM_DIR/wifi-rescue.png"
+    fi
+    if [ -n "$IDLE_IMAGE" ]; then
+      IDLE_LOG_MSG="Configured Wi-Fi network can't connect — showing rescue screen (hotspot + retry info)."
+    else
+      "$SITESTREAM_DIR/generate-idle-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
+      IDLE_IMAGE="$SITESTREAM_DIR/idle.png"
+      IDLE_LOG_MSG="No video scheduled — showing idle screen."
+    fi
     if [ -f "$IDLE_IMAGE" ]; then
       IDLE_MTIME=$(get_mtime "$IDLE_IMAGE")
       if [ "$CURRENT_VIDEO_PATH" != "$IDLE_IMAGE" ] || [ "$IDLE_MTIME" != "$CURRENT_STATIC_IMAGE_MTIME" ] || ! kill -0 "$VLC_PID" 2>/dev/null; then
-        log "No video scheduled — showing idle screen."
+        log "$IDLE_LOG_MSG"
         start_vlc "$IDLE_IMAGE" no-multicast
         CURRENT_STATIC_IMAGE_MTIME="$IDLE_MTIME"
       fi

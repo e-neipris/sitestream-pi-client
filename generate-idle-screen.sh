@@ -1,14 +1,15 @@
 #!/bin/bash
 # SiteStream Pi Client — Idle Screen Generator
 #
-# Produces a static PNG that player.sh displays whenever this device IS
-# claimed and configured but has no schedule entry matching the current
-# time — replacing a blank/black screen (the old behavior) with something
-# that tells whoever's standing in front of it that this is expected, not
-# broken, and how to fix it if it isn't. Counterpart to
-# generate-onboarding-screen.sh, which covers the *unclaimed* case; this one
-# only ever runs for an already-claimed device, so it never mentions
-# claiming.
+# Produces a static PNG that player.sh displays whenever this device has
+# something configured (a cloud claim, OR a schedule built locally through
+# the standalone-mode portal — see player.sh's own onboarding-vs-idle gate)
+# but no schedule entry matching the current time — replacing a blank/black
+# screen (the old behavior) with something that tells whoever's standing in
+# front of it that this is expected, not broken, and how to fix it if it
+# isn't. Counterpart to generate-onboarding-screen.sh, which covers the case
+# where NOTHING has been configured yet either way; this one deliberately
+# never mentions cloud-claim status since it applies regardless of it.
 #
 # Idempotent by design, same pattern as generate-onboarding-screen.sh: skips
 # regenerating if the output already exists and this device's LAN IP hasn't

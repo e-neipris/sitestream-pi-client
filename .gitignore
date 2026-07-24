@@ -12,3 +12,8 @@ pi-portal/server/dist/
 pi-portal/server/node_modules/
 pi-portal/web/node_modules/
 pi-portal/web-dist/
+
+# Built release tarballs (make-release.sh output) — regenerated on demand,
+# not something to check in; they'd also make the repo grow unboundedly
+# with every version ever built.
+Releases/
