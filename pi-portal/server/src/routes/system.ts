@@ -228,37 +228,70 @@ function listNetworkInterfaces(): string[] {
     .map(([name]) => name)
 }
 
+// Must match wifi-ap-fallback.sh's own HOTSPOT_CONN_NAME — duplicated
+// rather than shared, same as that script's own SSID/password duplication
+// with generate-onboarding-screen.sh (see that file's comment).
+const HOTSPOT_CONN_NAME = 'SiteStream-Setup'
+
 async function scanWifi(): Promise<{ ssid: string; signal: number }[]> {
   if (await isWifiRadioBlocked()) {
     throw new Error('WIFI_BLOCKED')
   }
 
+  const iface = await detectWifiInterface()
+
+  // NetworkManager doesn't expose scan results through `nmcli device wifi
+  // list` for a device that's currently ACTIVE AS AN AP (this device's own
+  // setup hotspot) — confirmed live: `nmcli device wifi rescan` reports
+  // success, and the underlying kernel-level scan genuinely finds every
+  // nearby network across every channel and band (this chip supports
+  // concurrent AP+scan fine — the same mechanism as rogue-AP detection —
+  // it's not the single-radio AP-or-client limitation that applies to
+  // actually *joining* a network). But `nmcli dev wifi list` only ever
+  // echoes the device's own hotspot SSID back regardless, which used to
+  // satisfy this function's old "did nmcli find anything" check below and
+  // return just that one self-entry — hiding every real network from
+  // someone who is, in the overwhelmingly common case, only reachable
+  // BECAUSE they're connected to that same hotspot. Skip nmcli's list
+  // entirely in this state and go straight to the `iw scan` path below,
+  // which does work.
+  const actingAsHotspot = iface
+    ? await execFile('nmcli', ['-t', '-f', 'GENERAL.CONNECTION', 'device', 'show', iface])
+        .then(({ stdout }) => {
+          const colon = stdout.indexOf(':')
+          return colon !== -1 && stdout.slice(colon + 1).trim() === HOTSPOT_CONN_NAME
+        })
+        .catch(() => false)
+    : false
+
   // Prefer NetworkManager (Bookworm/Trixie's default) — falls back to a raw
-  // `iw` scan for dhcpcd+wpa_supplicant setups (Bullseye's default). Neither
-  // call takes any user-supplied input, so a plain shell string is fine here
-  // — no injection surface, unlike wifi/connect below.
-  try {
-    // `nmcli ... list` shows the LAST scan's cached results, which is often
-    // empty if nothing has triggered a scan recently — request a fresh one
-    // first. Best-effort: NetworkManager rate-limits rescans, so a failure
-    // here just means "use whatever's cached," not fatal.
-    await exec('nmcli device wifi rescan 2>/dev/null').catch(() => {})
-    const { stdout } = await exec('nmcli -t -f SSID,SIGNAL dev wifi list 2>/dev/null')
-    const seen = new Set<string>()
-    const networks = stdout.split('\n')
-      .map((line) => line.split(':'))
-      .filter(([ssid]) => ssid && !seen.has(ssid) && seen.add(ssid))
-      .map(([ssid, signal]) => ({ ssid, signal: Number(signal) || 0 }))
-    // nmcli can run successfully and still report zero networks (rather
-    // than erroring) on a dhcpcd+wpa_supplicant box where it's present but
-    // not actually managing the wireless interface — fall through to the
-    // iw path below instead of silently returning an empty list here.
-    if (networks.length > 0) return networks
-  } catch {
-    // nmcli itself isn't present/usable at all — fall through below.
+  // `iw` scan for dhcpcd+wpa_supplicant setups (Bullseye's default) and for
+  // the acting-as-hotspot case above. Neither call takes any user-supplied
+  // input, so a plain shell string is fine here — no injection surface,
+  // unlike wifi/connect below.
+  if (!actingAsHotspot) {
+    try {
+      // `nmcli ... list` shows the LAST scan's cached results, which is often
+      // empty if nothing has triggered a scan recently — request a fresh one
+      // first. Best-effort: NetworkManager rate-limits rescans, so a failure
+      // here just means "use whatever's cached," not fatal.
+      await exec('nmcli device wifi rescan 2>/dev/null').catch(() => {})
+      const { stdout } = await exec('nmcli -t -f SSID,SIGNAL dev wifi list 2>/dev/null')
+      const seen = new Set<string>()
+      const networks = stdout.split('\n')
+        .map((line) => line.split(':'))
+        .filter(([ssid]) => ssid && !seen.has(ssid) && seen.add(ssid))
+        .map(([ssid, signal]) => ({ ssid, signal: Number(signal) || 0 }))
+      // nmcli can run successfully and still report zero networks (rather
+      // than erroring) on a dhcpcd+wpa_supplicant box where it's present but
+      // not actually managing the wireless interface — fall through to the
+      // iw path below instead of silently returning an empty list here.
+      if (networks.length > 0) return networks
+    } catch {
+      // nmcli itself isn't present/usable at all — fall through below.
+    }
   }
 
-  const iface = await detectWifiInterface()
   if (!iface) {
     throw new Error('No wireless interface found (checked via `iw dev`)')
   }
@@ -271,11 +304,30 @@ async function scanWifi(): Promise<{ ssid: string; signal: number }[]> {
   // an actual `iw` failure as a real, logged error.
   const { stdout } = await execFile('sudo', ['-n', 'iw', 'dev', iface, 'scan'])
   const seen = new Set<string>()
-  return stdout.split('\n')
-    .filter((line) => line.trim().startsWith('SSID:'))
-    .map((line) => line.replace(/^\s*SSID:\s*/, '').trim())
-    .filter((ssid) => ssid && !seen.has(ssid) && seen.add(ssid))
-    .map((ssid) => ({ ssid, signal: 0 }))
+  const results: { ssid: string; signal: number }[] = []
+  // `signal:` (dBm) always precedes the `SSID:` line within the same BSS
+  // block in `iw scan` output — tracked per-block (reset on each new `BSS `
+  // header) and converted to the same rough 0-100 percent NetworkManager's
+  // own SIGNAL column uses, so this fallback path's numbers land in the
+  // same ballpark whichever path a given call ends up taking.
+  let lastSignalDbm: number | null = null
+  for (const rawLine of stdout.split('\n')) {
+    const line = rawLine.trim()
+    if (line.startsWith('BSS ')) {
+      lastSignalDbm = null
+    } else if (line.startsWith('signal:')) {
+      const match = line.match(/signal:\s*(-?\d+(?:\.\d+)?)/)
+      if (match) lastSignalDbm = Number(match[1])
+    } else if (line.startsWith('SSID:')) {
+      const ssid = line.replace(/^SSID:\s*/, '').trim()
+      if (ssid && !seen.has(ssid)) {
+        seen.add(ssid)
+        const signal = lastSignalDbm !== null ? Math.max(0, Math.min(100, Math.round(2 * (lastSignalDbm + 100)))) : 0
+        results.push({ ssid, signal })
+      }
+    }
+  }
+  return results
 }
 
 // Auth is now enforced globally in index.ts for the whole portal, not just

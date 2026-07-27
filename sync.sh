@@ -374,9 +374,17 @@ if [ "$FACTORY_RESET_REQUESTED" = "true" ]; then
   if curl -sf -X POST -H "Authorization: Bearer $DEVICE_TOKEN" --max-time 15 \
        "$API_URL/api/devices/$DEVICE_ID/factory-reset/ack" > /dev/null; then
     log "Acknowledged. Running factory reset now."
-    FACTORY_RESET_ARGS=(--yes)
-    [ "$FACTORY_RESET_FORGET_WIFI" = "true" ] && FACTORY_RESET_ARGS+=(--forget-wifi)
-    "$SITESTREAM_DIR/factory-reset.sh" "${FACTORY_RESET_ARGS[@]}"
+    # Deliberately never passes --forget-wifi to factory-reset.sh here, even
+    # when FACTORY_RESET_FORGET_WIFI is true. Confirmed live: forgetting the
+    # Wi-Fi network severs whatever connection is currently active — that's
+    # the whole point of it — which used to happen INSIDE factory-reset.sh,
+    # before this process ever got to the /confirm call below. The result: a
+    # factory reset that genuinely dropped the device's Wi-Fi (working as
+    # intended) but silently never told the API it had finished, because the
+    # confirm call right after had no network left to reach it with. Forget-
+    # wifi.sh now runs separately, further below, only after confirm has
+    # already gone through over the still-live connection.
+    "$SITESTREAM_DIR/factory-reset.sh" --yes
     # Uses $DEVICE_TOKEN/$DEVICE_ID already loaded into this process's memory
     # from the manifest fetch earlier in this same run — factory-reset.sh has
     # by now wiped both out of config.env on disk, but that doesn't affect a
@@ -386,22 +394,23 @@ if [ "$FACTORY_RESET_REQUESTED" = "true" ]; then
     # is what actually makes that happen, synchronously, before this device's
     # own next cron tick could otherwise race it by checking in via serial
     # and getting silently reissued a fresh token into the same zone.
-    curl -sf -X POST -H "Authorization: Bearer $DEVICE_TOKEN" --max-time 15 \
-         "$API_URL/api/devices/$DEVICE_ID/factory-reset/confirm" > /dev/null \
-      || log "WARN: could not confirm factory-reset completion to the API (device is still reset locally either way)."
-    # Reboot only for --forget-wifi, and only *after* the confirm call above —
-    # confirmed live that forgetting a Wi-Fi connection profile can leave
-    # NetworkManager's radio/device state stuck (no hotspot broadcasting, no
-    # rejoin) until a full reboot, not just a service restart. Deliberately
-    # NOT inside factory-reset.sh itself: that script also runs standalone
-    # (a human resetting a device by hand), and more importantly, a reboot
-    # triggered from inside it would race the confirm call above — if this
-    # process gets killed by the reboot before reaching that curl, an admin
-    # who asked to release this device would find it still sitting claimed,
-    # exactly the race releaseOnFactoryReset/confirm was built to prevent.
-    # Doing it here, last, keeps that guarantee intact.
+    if curl -sf -X POST -H "Authorization: Bearer $DEVICE_TOKEN" --max-time 15 \
+         "$API_URL/api/devices/$DEVICE_ID/factory-reset/confirm" > /dev/null; then
+      log "Confirmed factory-reset completion to the API."
+    else
+      log "WARN: could not confirm factory-reset completion to the API (device is still reset locally either way)."
+    fi
+    # Forgetting Wi-Fi (and the reboot that follows it) only ever happens
+    # AFTER the confirm call above, and only for --forget-wifi — see this
+    # block's opening comment, and forget-wifi.sh's own comment, for why
+    # that ordering is load-bearing rather than incidental. The reboot
+    # itself is still needed even though forget-wifi.sh already ran: confirmed
+    # live that forgetting a Wi-Fi connection profile can leave NetworkManager's
+    # radio/device state stuck (no hotspot broadcasting, no rejoin) until a
+    # full reboot, not just a service restart.
     if [ "$FACTORY_RESET_FORGET_WIFI" = "true" ]; then
-      log "Rebooting to fully clear networking state after --forget-wifi."
+      "$SITESTREAM_DIR/forget-wifi.sh"
+      log "Rebooting to fully clear networking state after forgetting Wi-Fi."
       sudo -n systemctl reboot
     fi
     exit 0

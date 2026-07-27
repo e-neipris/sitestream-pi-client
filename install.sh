@@ -170,6 +170,7 @@ if [ "$SCRIPT_DIR" != "$PI_HOME/sitestream" ]; then
   cp "$SCRIPT_DIR/generate-idle-screen.sh"        "$PI_HOME/sitestream/generate-idle-screen.sh"
   cp "$SCRIPT_DIR/generate-wifi-rescue-screen.sh" "$PI_HOME/sitestream/generate-wifi-rescue-screen.sh"
   cp "$SCRIPT_DIR/factory-reset.sh"               "$PI_HOME/sitestream/factory-reset.sh"
+  cp "$SCRIPT_DIR/forget-wifi.sh"                 "$PI_HOME/sitestream/forget-wifi.sh"
   cp "$SCRIPT_DIR/wifi-ap-fallback.sh"            "$PI_HOME/sitestream/wifi-ap-fallback.sh"
   cp "$SCRIPT_DIR/install.sh"                     "$PI_HOME/sitestream/install.sh"
 fi
@@ -180,6 +181,7 @@ chmod +x "$PI_HOME/sitestream/generate-onboarding-screen.sh"
 chmod +x "$PI_HOME/sitestream/generate-idle-screen.sh"
 chmod +x "$PI_HOME/sitestream/generate-wifi-rescue-screen.sh"
 chmod +x "$PI_HOME/sitestream/factory-reset.sh"
+chmod +x "$PI_HOME/sitestream/forget-wifi.sh"
 chmod +x "$PI_HOME/sitestream/wifi-ap-fallback.sh"
 chmod +x "$PI_HOME/sitestream/install.sh"
 

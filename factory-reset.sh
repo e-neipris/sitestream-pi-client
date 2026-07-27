@@ -99,34 +99,14 @@ fi
 # anything above. Confirmed live: a factory reset with none of this stayed
 # joined to its network the whole time. Opt-in via --forget-wifi (see the
 # usage comment at the top of this file for why this defaults off) actually
-# removes those saved profiles too — every Wi-Fi connection except this
-# script's own setup hotspot, which isn't a real user-joined network and
-# gets regenerated fresh by wifi-ap-fallback.sh whenever it's next needed.
-if [ "$FORGET_WIFI" = "true" ] && command -v nmcli >/dev/null 2>&1; then
-  echo "Forgetting saved Wi-Fi network(s) (--forget-wifi)…"
-  while IFS=: read -r conn_name conn_type; do
-    # nmcli connection show's TYPE column uses NetworkManager's internal
-    # settings-type names (802-11-wireless, 802-3-ethernet, ...), NOT the
-    # generic "wifi"/"ethernet" nmcli device show uses — confirmed live
-    # against a real device that "wifi" here never matched anything, so this
-    # loop silently deleted nothing at all, every single time, regardless of
-    # the sudo fix below. That's why forget-wifi never actually worked.
-    [ "$conn_type" = "802-11-wireless" ] || continue
-    [ "$conn_name" = "$HOTSPOT_CONN_NAME" ] && continue
-    # sudo -n, not a plain call — confirmed live that deleting a
-    # NetworkManager connection profile from this non-interactive systemd
-    # service context (no logind session) hits the same polkit permission
-    # denial wifi-ap-fallback.sh's own nmcli calls already had to route
-    # around. Without this, the delete silently failed every time (the ||
-    # WARN below swallowed it into a log nobody was watching in real time),
-    # and the device stayed joined to its old network through the entire
-    # rest of this script — the exact "forget-wifi did nothing" behavior
-    # confirmed against a real device. Needs the matching sudoers grant for
-    # `nmcli connection delete` specifically — see install.sh (the existing
-    # `connection down` grant covers a different subcommand, not this one).
-    sudo -n nmcli connection delete "$conn_name" >/dev/null 2>&1 \
-      || echo "WARN: could not delete Wi-Fi connection '$conn_name'"
-  done < <(nmcli -t -f NAME,TYPE connection show 2>/dev/null)
+# removes those saved profiles too, via forget-wifi.sh (extracted into its
+# own file so sync.sh's remote-triggered path can run it separately, AFTER
+# confirming completion to the API — see that script's own comment on why:
+# this step severs whatever network connection is currently active, which
+# used to silently break the very confirm call that was supposed to run
+# right after it).
+if [ "$FORGET_WIFI" = "true" ]; then
+  "$SITESTREAM_DIR/forget-wifi.sh"
 fi
 
 echo "Clearing local provisioning/state files…"
@@ -202,7 +182,7 @@ if [ "$FORGET_WIFI" = "true" ]; then
   echo "NetworkManager's Wi-Fi radio/device state stuck (no setup hotspot"
   echo "broadcasting, won't rejoin anything) until a full reboot, not just a"
   echo "service restart. Recommend rebooting now: sudo reboot"
-  echo "(Not done automatically here — see sync.sh's own --forget-wifi"
-  echo "handling for why the remote-triggered path reboots after, not this"
-  echo "script directly.)"
+  echo "(Not done automatically here — the remote-triggered path (sync.sh)"
+  echo "reboots itself, after its own API confirm call; this script is also"
+  echo "run standalone by a human, who should decide when to reboot.)"
 fi
