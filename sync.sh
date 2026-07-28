@@ -39,6 +39,13 @@ APP_URL="${APP_URL:-https://app.sitestream.app}"
 VIDEO_DIR="${VIDEO_DIR:-$SITESTREAM_DIR/videos}"
 SCHEDULE_FILE="$SITESTREAM_DIR/schedule.json"
 MANIFEST_HASH_FILE="$SITESTREAM_DIR/.manifest_hash"
+# Touched on every fully successful manifest fetch, regardless of whether the
+# manifest content actually changed (unlike MANIFEST_HASH_FILE, which only
+# reflects the last CONFIRMED hash) — this is player.sh's only way to know
+# "are we actually still talking to SiteStream Cloud," since player.sh has no
+# network access of its own by design. See player.sh's connectivity-overlay
+# logic for how its age gets used.
+LAST_SYNC_OK_FILE="$SITESTREAM_DIR/.last_sync_ok"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"; }
 
 # Translates a curl exit code into a human-readable reason, since -f/-s alone
@@ -164,7 +171,7 @@ revert_to_standalone() {
   grep -v '^DEVICE_TOKEN=' "$CONFIG" 2>/dev/null > "$CONFIG.tmp" || true
   mv "$CONFIG.tmp" "$CONFIG"
   chmod 600 "$CONFIG"
-  rm -f "$MANIFEST_HASH_FILE" "$SCHEDULE_FILE"
+  rm -f "$MANIFEST_HASH_FILE" "$SCHEDULE_FILE" "$LAST_SYNC_OK_FILE"
   apply_sync_interval 1
 }
 
@@ -289,6 +296,8 @@ if [ "$MANIFEST_HTTP_CODE" != "200" ]; then
   apply_sync_interval 1
   exit 0
 fi
+
+date +%s > "$LAST_SYNC_OK_FILE"
 
 MANIFEST_VERSION=$(echo "$MANIFEST" | jq -r '.manifestVersion')
 LAST_CONFIRMED=$(cat "$MANIFEST_HASH_FILE" 2>/dev/null || echo "")

@@ -26,6 +26,10 @@ CURRENT_VIDEO_PATH=""
 # same, not that the content behind it is still the same).
 CURRENT_STATIC_IMAGE_MTIME=""
 CURRENT_MULTICAST_TARGET=""
+# What VLC was actually last started with — "disconnected" or "" — so a
+# transition can be detected and acted on (see is_disconnected below), same
+# tracked-vs-desired-state pattern as CURRENT_MULTICAST_TARGET above.
+CURRENT_OVERLAY_STATE=""
 VLC_PID=""
 MULTICAST_PID=""
 STATUS_FILE="$SITESTREAM_DIR/status.json"
@@ -239,8 +243,43 @@ stop_vlc() {
   VLC_PID=""
   CURRENT_VIDEO_PATH=""
   CURRENT_STATIC_IMAGE_MTIME=""
+  CURRENT_OVERLAY_STATE=""
   stop_multicast
   pkill -f "vlc" 2>/dev/null || true
+}
+
+# True when this is a cloud-claimed device that hasn't actually reached the
+# API in a while — QA feedback: a device losing connectivity mid-playback
+# kept showing its cached video with zero on-screen indication anything was
+# wrong. Deliberately NOT used for the onboarding/idle/rescue static screens
+# above — those already say so explicitly (rescue screen: "Wi-Fi Connection
+# Problem"); this is only for the "still playing real scheduled content"
+# case those screens don't cover at all.
+#
+# .wifi_rescue_state (see wifi-ap-fallback.sh) is checked first as an
+# immediate, high-confidence signal — it only covers local Wi-Fi association
+# failure though, not "Wi-Fi's fine but the API/DNS/token is broken," which
+# is why LAST_SYNC_OK_FILE's own age is checked too, not relied on alone.
+# Threshold scales with the zone's own configured sync interval (2 missed
+# cycles, same STALE_MISSED_SYNCS=2 shape the SaaS's own isDeviceDown uses)
+# with a 10-minute floor so a fast 1-minute interval doesn't flap this
+# on/off from ordinary jitter.
+WIFI_RESCUE_STATE_FILE="$SITESTREAM_DIR/.wifi_rescue_state"
+SYNC_INTERVAL_FILE="$SITESTREAM_DIR/.sync_interval"
+LAST_SYNC_OK_FILE="$SITESTREAM_DIR/.last_sync_ok"
+is_disconnected() {
+  [ -n "${DEVICE_TOKEN:-}" ] || return 1
+  [ -f "$WIFI_RESCUE_STATE_FILE" ] && return 0
+
+  local last_ok interval_min threshold_min
+  last_ok=$(cat "$LAST_SYNC_OK_FILE" 2>/dev/null)
+  [[ "$last_ok" =~ ^[0-9]+$ ]] || return 0
+
+  interval_min=$(cat "$SYNC_INTERVAL_FILE" 2>/dev/null)
+  [[ "$interval_min" =~ ^[0-9]+$ ]] || interval_min=15
+  threshold_min=$(( interval_min * 2 > 10 ? interval_min * 2 : 10 ))
+
+  [ $(( $(date +%s) - last_ok )) -gt $(( threshold_min * 60 )) ]
 }
 
 # Used only for the onboarding/idle static-image screens — see
@@ -259,8 +298,31 @@ start_vlc() {
   # entire time no real content is scheduled. Real scheduled video playback
   # never passes this.
   local skip_multicast="${2:-}"
+  # "disconnected": adds a small bottom-right marquee, for real scheduled
+  # video only (see is_disconnected above) — never passed for the
+  # onboarding/idle/rescue static screens, which already communicate
+  # connectivity problems a different way.
+  local show_disconnected="${3:-}"
   stop_vlc
   log "Starting VLC: $video_path"
+
+  MARQ_ARGS=()
+  if [ "$show_disconnected" = "disconnected" ]; then
+    # marq is a subpicture SOURCE (not a filter VLC applies after the fact),
+    # composited by the vout itself — confirmed independent of --no-osd
+    # above (that only suppresses VLC's own transient volume/seek popups).
+    # --marq-timeout 0: show continuously, not just briefly on start.
+    # Position 10 = bottom(8) + right(2).
+    MARQ_ARGS=(
+      --sub-source marq
+      --marq-marquee "Not connected to SiteStream Cloud"
+      --marq-position 10
+      --marq-size 18
+      --marq-opacity 200
+      --marq-color 0xFBBF24
+      --marq-timeout 0
+    )
+  fi
 
   # --vout drm_vout: without this, VLC auto-probes video-output backends in
   # priority order — xcb (X11) first, among others — before ever reaching
@@ -309,6 +371,7 @@ start_vlc() {
     --no-osd \
     --quiet \
     --aout alsa \
+    "${MARQ_ARGS[@]}" \
     --extraintf http,logger \
     --http-host 127.0.0.1 \
     --http-port "$VLC_HTTP_PORT" \
@@ -319,6 +382,7 @@ start_vlc() {
     "$video_path" &
   VLC_PID=$!
   CURRENT_VIDEO_PATH="$video_path"
+  CURRENT_OVERLAY_STATE="$show_disconnected"
   LAST_VLC_TIME=""
   LAST_DISPLAYED_PICTURES="0"
   STALL_COUNT=0
@@ -426,6 +490,14 @@ while true; do
 
   WANTED=$(get_current_video)
 
+  # Only meaningful once there's real scheduled content to show it over —
+  # see is_disconnected's own comment for why the onboarding/idle/rescue
+  # screens below are excluded.
+  OVERLAY_WANT=""
+  if [ -n "$WANTED" ] && is_disconnected; then
+    OVERLAY_WANT="disconnected"
+  fi
+
   if [ -z "$WANTED" ]; then
     # Nothing scheduled right now — show an idle screen (serial + how to
     # manage this device) instead of leaving the display blank. Same
@@ -468,13 +540,25 @@ while true; do
     log "WARN: Scheduled video not found locally: $WANTED (waiting for sync)"
   elif [ "$WANTED" != "$CURRENT_VIDEO_PATH" ]; then
     log "Switching to: $WANTED"
-    start_vlc "$WANTED"
+    start_vlc "$WANTED" "" "$OVERLAY_WANT"
   elif ! kill -0 "$VLC_PID" 2>/dev/null; then
     # VLC died unexpectedly — restart it (and multicast alongside it)
     VLC_RESTART_COUNT=$((VLC_RESTART_COUNT + 1))
     log "VLC not running, restarting: $WANTED"
     signal_urgent_health
-    start_vlc "$WANTED"
+    start_vlc "$WANTED" "" "$OVERLAY_WANT"
+  elif [ "$OVERLAY_WANT" != "$CURRENT_OVERLAY_STATE" ]; then
+    # Same video, but connectivity state flipped since VLC was last started —
+    # the marq flag is startup-only (no live control channel for it — see
+    # is_disconnected's comment), so this is a deliberate, infrequent
+    # (minutes-scale) restart, same tradeoff already accepted for a
+    # multicast-config change below.
+    if [ "$OVERLAY_WANT" = "disconnected" ]; then
+      log "Connectivity lost — adding on-screen indicator."
+    else
+      log "Connectivity restored — removing on-screen indicator."
+    fi
+    start_vlc "$WANTED" "" "$OVERLAY_WANT"
   elif [ "$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT" != "$CURRENT_MULTICAST_TARGET" ]; then
     # Same video, same display process — only the multicast config changed
     # (or was toggled on/off). Restarting just that process doesn't touch

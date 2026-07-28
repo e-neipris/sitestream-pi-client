@@ -122,7 +122,7 @@ rm -f "$SITESTREAM_DIR/.manifest_hash" "$SITESTREAM_DIR/.sync_interval" \
       "$SITESTREAM_DIR/.sync.lock" "$SITESTREAM_DIR/onboarding.png" \
       "$SITESTREAM_DIR/.wifi_rescue_state" "$SITESTREAM_DIR/.wifi_rescue_last_retry" \
       "$SITESTREAM_DIR/.wifi_struggling_since" "$SITESTREAM_DIR/.wifi_rescue_screen_state" \
-      "$SITESTREAM_DIR/wifi-rescue.png"
+      "$SITESTREAM_DIR/wifi-rescue.png" "$SITESTREAM_DIR/.last_sync_ok"
 
 echo "Clearing standalone-mode local portal database (videos, schedules, admin login)…"
 # Deleting the file outright — not just its rows — is what actually resets
