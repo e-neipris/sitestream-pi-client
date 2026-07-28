@@ -67,7 +67,7 @@ export default function App() {
         {authView === 'login' ? (
           <LoginForm onLoggedIn={(mustChange) => setAuthView(mustChange ? 'change-password' : 'app')} />
         ) : (
-          <ChangePasswordForm onChanged={() => setAuthView('app')} />
+          <ChangePasswordForm onChanged={() => { setTab('system'); setAuthView('app') }} />
         )}
       </div>
     )

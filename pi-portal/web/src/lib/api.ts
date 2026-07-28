@@ -155,4 +155,6 @@ export const systemApi = {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
   },
+  factoryReset: (data: { forgetWifi: boolean }) =>
+    api.post<{ ok: boolean; message: string }>('/system/factory-reset', data),
 }

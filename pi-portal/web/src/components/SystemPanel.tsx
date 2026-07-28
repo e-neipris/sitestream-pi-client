@@ -140,6 +140,14 @@ function SettingsView() {
 
   const timezoneOptions = timezones ?? (info?.timezone ? [info.timezone] : [])
 
+  const [showResetConfirm, setShowResetConfirm] = useState(false)
+  const [resetForgetWifi, setResetForgetWifi] = useState(false)
+  const factoryResetMut = useMutation({
+    mutationFn: () => systemApi.factoryReset({ forgetWifi: resetForgetWifi }),
+    onSuccess: (res) => { setNotice(res.data.message); setShowResetConfirm(false) },
+    onError: (err: any) => { setError(apiErrorMessage(err, 'Could not start factory reset')); setShowResetConfirm(false) },
+  })
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
       {notice && (
@@ -163,7 +171,14 @@ function SettingsView() {
           <Stat label="Timezone" value={info?.timezone ?? '—'} />
           <Stat
             label="Clock"
-            value={info ? new Date(info.currentTime).toLocaleString() : '—'}
+            // info.currentTime is a UTC instant — formatting it with no
+            // `timeZone` option renders it in the BROWSER's local timezone,
+            // not the device's, so this looked "stuck" on whatever timezone
+            // the viewing laptop/phone happened to be in regardless of what
+            // was actually applied on the Pi. Pin formatting to the device's
+            // own reported timezone (Timezone stat above, straight from
+            // `timedatectl show`) instead.
+            value={info ? new Date(info.currentTime).toLocaleString(undefined, info.timezone ? { timeZone: info.timezone } : undefined) : '—'}
             valueColor={info?.ntpEnabled ? (info?.ntpSynced ? '#22c55e' : '#f59e0b') : '#94a3b8'}
             sub={info ? `NTP ${info.ntpEnabled ? (info.ntpSynced ? 'synced' : 'syncing…') : 'off'}` : undefined}
           />
@@ -366,6 +381,82 @@ function SettingsView() {
           <button type="submit" style={btn} disabled={uploading}>{uploading ? 'Uploading…' : 'Upload & Install'}</button>
         </form>
       </div>
+
+      <div style={{ ...card, borderColor: '#7f1d1d' }}>
+        <h2 style={{ ...h2, color: '#f87171' }}>Danger Zone</h2>
+        <p style={{ color: '#64748b', fontSize: 12, marginBottom: 12 }}>
+          Wipes this device's local videos, schedule, and portal login back to a fresh install. Does not remove it
+          from SiteStream Cloud if it's claimed — do that from the SaaS separately.
+        </p>
+        <button type="button" style={dangerBtn} onClick={() => setShowResetConfirm(true)}>
+          Factory Reset…
+        </button>
+      </div>
+
+      {showResetConfirm && (
+        <FactoryResetModal
+          forgetWifi={resetForgetWifi}
+          onForgetWifiChange={setResetForgetWifi}
+          pending={factoryResetMut.isPending}
+          onCancel={() => setShowResetConfirm(false)}
+          onConfirm={() => factoryResetMut.mutate()}
+        />
+      )}
+    </div>
+  )
+}
+
+function FactoryResetModal({ forgetWifi, onForgetWifiChange, pending, onCancel, onConfirm }: {
+  forgetWifi: boolean
+  onForgetWifiChange: (v: boolean) => void
+  pending: boolean
+  onCancel: () => void
+  onConfirm: () => void
+}) {
+  return (
+    <Overlay onClose={pending ? () => {} : onCancel}>
+      <h2 style={{ ...modalTitle, color: '#f87171' }}>Factory Reset This Device</h2>
+      <p style={{ color: '#94a3b8', fontSize: 13, marginBottom: 12 }}>
+        This permanently deletes this device's local videos, schedule, and cached state, and resets the portal
+        login back to <code>admin</code> / <code>SiteStream</code> (forcing a password change again next login).
+        <strong style={{ color: '#e2e8f0' }}> This cannot be undone.</strong>
+      </p>
+      <p style={{ color: '#94a3b8', fontSize: 13, marginBottom: 16 }}>
+        If this device is claimed in SiteStream Cloud, it is <strong style={{ color: '#e2e8f0' }}>not</strong> released
+        or removed from its Zone — that's a separate step an admin has to do from the SaaS. This only resets what's
+        stored locally on the device itself.
+      </p>
+      <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, fontSize: 13, color: '#e2e8f0', marginBottom: 20, cursor: pending ? 'default' : 'pointer' }}>
+        <input
+          type="checkbox"
+          checked={forgetWifi}
+          disabled={pending}
+          onChange={(e) => onForgetWifiChange(e.target.checked)}
+          style={{ marginTop: 2 }}
+        />
+        <span>
+          Also forget this device's Wi-Fi network(s)
+          <br />
+          <span style={{ color: '#64748b', fontSize: 12 }}>
+            The device will reboot automatically afterward and show its setup hotspot again — you'll need to rejoin
+            it to Wi-Fi from scratch, the same as a brand new unit.
+          </span>
+        </span>
+      </label>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+        <button type="button" style={ghostBtn} disabled={pending} onClick={onCancel}>Cancel</button>
+        <button type="button" style={dangerBtn} disabled={pending} onClick={onConfirm}>
+          {pending ? 'Resetting…' : 'Factory Reset This Device'}
+        </button>
+      </div>
+    </Overlay>
+  )
+}
+
+function Overlay({ children, onClose }: { children: React.ReactNode; onClose: () => void }) {
+  return (
+    <div style={overlay} onClick={onClose}>
+      <div style={modal} onClick={(e) => e.stopPropagation()}>{children}</div>
     </div>
   )
 }
@@ -398,6 +489,10 @@ const label: React.CSSProperties = { display: 'flex', flexDirection: 'column', g
 const input: React.CSSProperties = { background: '#0f172a', border: '1px solid #334155', borderRadius: 6, padding: '7px 12px', color: '#e2e8f0', fontSize: 13, outline: 'none', width: '100%' }
 const btn: React.CSSProperties = { background: '#0ea5e9', color: '#fff', border: 'none', borderRadius: 6, padding: '7px 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer' }
 const ghostBtn: React.CSSProperties = { background: 'transparent', color: '#94a3b8', border: '1px solid #334155', borderRadius: 6, padding: '7px 12px', fontSize: 13, cursor: 'pointer' }
+const dangerBtn: React.CSSProperties = { background: '#450a0a', color: '#f87171', border: '1px solid #7f1d1d', borderRadius: 6, padding: '7px 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer' }
+const overlay: React.CSSProperties = { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100 }
+const modal: React.CSSProperties = { background: '#1e293b', border: '1px solid #334155', borderRadius: 12, padding: 24, width: 460, maxWidth: '90vw', maxHeight: '90vh', overflowY: 'auto' }
+const modalTitle: React.CSSProperties = { fontSize: 16, fontWeight: 700, color: '#e2e8f0', marginBottom: 16 }
 const noticeBanner: React.CSSProperties = {
   display: 'flex', justifyContent: 'space-between', alignItems: 'center',
   background: '#0c2d1e', border: '1px solid #14532d', color: '#86efac',

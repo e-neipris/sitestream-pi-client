@@ -149,6 +149,25 @@ apply_sync_interval() {
   fi
 }
 
+# Called when the API tells us, via manifest.ts's device_not_found response,
+# that this device's cloud record is gone (removed/unclaimed from the SaaS
+# side) — confirmed in QA as a real scenario: a device removed mid-reboot
+# just kept retrying its manifest fetch forever, playing stale cached
+# content with no visible sign anything was wrong ("stranded on an
+# island"). This does NOT touch Wi-Fi, cached videos, or the portal admin
+# login — none of that is cloud-claim state, so wiping it here would be
+# needlessly destructive (that's what a real factory reset is for). Only
+# clears the cloud-schedule state, same file set factory-reset.sh treats as
+# "what unclaimed means" for these specific files, so the device falls back
+# to showing it needs to be claimed instead of silently going stale.
+revert_to_standalone() {
+  grep -v '^DEVICE_TOKEN=' "$CONFIG" 2>/dev/null > "$CONFIG.tmp" || true
+  mv "$CONFIG.tmp" "$CONFIG"
+  chmod 600 "$CONFIG"
+  rm -f "$MANIFEST_HASH_FILE" "$SCHEDULE_FILE"
+  apply_sync_interval 1
+}
+
 # listen.sh sets SYNC_TRIGGER=push when it invokes this script in response to
 # a server-sent "wake up now" event — see trigger_sync() in listen.sh. That's
 # a specific, one-time "something changed, act now" request with no
@@ -230,12 +249,22 @@ fi
 # ── 1. Fetch manifest ─────────────────────────────────────────────────────────
 log "Fetching manifest from $API_URL/api/manifest"
 
-MANIFEST=$(curl -sf \
+# Was `curl -sf` discarding the response body on any HTTP error — every
+# failure (DNS, timeout, dropped Wi-Fi, 401, 403, 404, 500) landed in the
+# same generic "failed, retry in 1 min" branch below, indistinguishable from
+# each other. Dropping -f and capturing the status code via -w instead lets
+# the device_not_found case (this device was removed/unclaimed — see
+# manifest.ts) get handled differently: revert to standalone instead of
+# retrying forever against an account that will never accept this token
+# again. A non-2xx curl exit code (connection-level failure) is still
+# caught below exactly as before.
+MANIFEST_RAW=$(curl -s \
   -H "Authorization: Bearer $DEVICE_TOKEN" \
   -H "Accept: application/json" \
   --max-time 30 \
+  -w '\n%{http_code}' \
   "$API_URL/api/manifest") || {
-  log "ERROR: Failed to fetch manifest. Retaining existing schedule."
+  log "ERROR: Failed to fetch manifest (network error). Retaining existing schedule."
   # Fall back to a fast retry cadence until we successfully reach the API
   # again — otherwise a device on a slow interval (up to 1 hour) could stay
   # unreachable for that whole window after a transient failure before even
@@ -245,6 +274,21 @@ MANIFEST=$(curl -sf \
   apply_sync_interval 1
   exit 0
 }
+
+MANIFEST_HTTP_CODE=$(echo "$MANIFEST_RAW" | tail -n1)
+MANIFEST=$(echo "$MANIFEST_RAW" | sed '$d')
+
+if [ "$MANIFEST_HTTP_CODE" = "401" ] && echo "$MANIFEST" | jq -e '.error == "device_not_found"' >/dev/null 2>&1; then
+  log "This device has been removed from SiteStream Cloud — reverting to standalone mode."
+  revert_to_standalone
+  exit 0
+fi
+
+if [ "$MANIFEST_HTTP_CODE" != "200" ]; then
+  log "ERROR: Failed to fetch manifest (HTTP $MANIFEST_HTTP_CODE). Retaining existing schedule."
+  apply_sync_interval 1
+  exit 0
+fi
 
 MANIFEST_VERSION=$(echo "$MANIFEST" | jq -r '.manifestVersion')
 LAST_CONFIRMED=$(cat "$MANIFEST_HASH_FILE" 2>/dev/null || echo "")

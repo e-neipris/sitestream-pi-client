@@ -88,6 +88,24 @@ is_claimed() {
   [ -n "${DEVICE_TOKEN:-}" ]
 }
 
+# `wlan0` was a hardcoded guess here — same mistake system.ts's own
+# detectWifiInterface() comment already documents having made and fixed
+# elsewhere in this repo (generate-onboarding-screen.sh and
+# generate-wifi-rescue-screen.sh both already use `iw dev` for this same
+# reason). This script was the one Wi-Fi-touching place that never got the
+# same fix: on hardware where the real interface isn't literally named
+# wlan0 (a USB adapter enumerating as wlan1, Bookworm's predictable-name
+# scheme, etc.), `nmcli device wifi hotspot ifname wlan0 ...` fails with
+# "Device 'wlan0' not found" every single time, forever — rescue-mode
+# DETECTION (wifi_profile_configured, interface-name-agnostic) still worked
+# and correctly wrote the rescue-state file, so the on-screen message showed
+# up looking legitimate while the hotspot it promised never actually came up.
+# Re-detected on every call (cheap) rather than cached once, so a USB
+# dongle re-enumerating mid-run doesn't wedge this into stale state forever.
+detect_wifi_interface() {
+  iw dev 2>/dev/null | awk '/Interface/{print $2; exit}'
+}
+
 # Any saved 802-11-wireless connection profile other than our own setup
 # hotspot means this device has been told to join a specific network
 # (portal Join, or cloud-pushed WIFI_SSID/WIFI_PASSWORD) — independent of
@@ -107,10 +125,12 @@ wifi_profile_configured() {
 # reads as device state 100/connected, so the state code alone can't tell
 # the two apart).
 wlan0_fully_connected() {
-  local code active
-  code=$(nmcli -t -f GENERAL.STATE device show wlan0 2>/dev/null | cut -d: -f2 | grep -o '^[0-9]*')
+  local iface code active
+  iface=$(detect_wifi_interface)
+  [ -n "$iface" ] || return 1
+  code=$(nmcli -t -f GENERAL.STATE device show "$iface" 2>/dev/null | cut -d: -f2 | grep -o '^[0-9]*')
   [ "$code" = "100" ] || return 1
-  active=$(nmcli -t -f GENERAL.CONNECTION device show wlan0 2>/dev/null | cut -d: -f2-)
+  active=$(nmcli -t -f GENERAL.CONNECTION device show "$iface" 2>/dev/null | cut -d: -f2-)
   [ "$active" != "$HOTSPOT_CONN_NAME" ]
 }
 
@@ -130,10 +150,16 @@ hotspot_active() {
 
 start_hotspot() {
   hotspot_active && return
-  log "Starting setup hotspot '$SSID'"
+  local iface
+  iface=$(detect_wifi_interface)
+  if [ -z "$iface" ]; then
+    log "WARN: no wireless interface found (checked via \`iw dev\`) — cannot start setup hotspot"
+    return
+  fi
+  log "Starting setup hotspot '$SSID' on $iface"
   # A freshly-imaged Raspberry Pi OS install can leave the Wi-Fi radio
   # itself soft-disabled at the NetworkManager level (nmcli radio -> WIFI:
-  # disabled), independent of the wlan0 hardware/driver being fine. When
+  # disabled), independent of the wifi hardware/driver being fine. When
   # that's the case `nmcli device wifi hotspot` fails every single time with
   # "device is not available" and never recovers on its own — confirmed live
   # against a brand-new Pi where this was the entire root cause of the
@@ -144,7 +170,7 @@ start_hotspot() {
   # logind session) hit real polkit permission denials during testing of
   # the portal's own Wi-Fi scan/join features; routing through the same
   # sudoers-grant pattern avoids repeating that here.
-  if ! sudo -n nmcli device wifi hotspot ifname wlan0 con-name "$HOTSPOT_CONN_NAME" ssid "$SSID" password "$HOTSPOT_PASSWORD" \
+  if ! sudo -n nmcli device wifi hotspot ifname "$iface" con-name "$HOTSPOT_CONN_NAME" ssid "$SSID" password "$HOTSPOT_PASSWORD" \
       >>"$SITESTREAM_DIR/logs/wifi-ap.log" 2>&1; then
     log "WARN: could not start hotspot — see logs/wifi-ap.log"
   fi

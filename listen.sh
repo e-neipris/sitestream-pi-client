@@ -63,6 +63,18 @@ watch_urgent_health &
 WATCHER_PID=$!
 trap 'log "Shutting down…"; kill "$WATCHER_PID" 2>/dev/null; pkill -f "devices/me/events" 2>/dev/null; exit 0' TERM INT
 
+# This service is Restart=always + WantedBy=multi-user.target, so it starts
+# fresh on every boot — but nothing previously told sync.sh to run right
+# away afterward. A device only ever recovered on its next cron tick, up to
+# its full configured sync interval away (15 min by default) — confirmed in
+# QA as a real recovery-time gap after an admin-requested reboot. One-shot,
+# only if already provisioned (an unclaimed device has nothing to sync yet —
+# sync.sh's own cron cadence handles that side of first-checkin).
+[ -f "$CONFIG" ] && source "$CONFIG"
+if [ -n "${DEVICE_TOKEN:-}" ]; then
+  trigger_sync "service start"
+fi
+
 BACKOFF=2
 MAX_BACKOFF=60
 

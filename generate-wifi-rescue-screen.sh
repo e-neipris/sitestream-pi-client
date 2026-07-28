@@ -65,9 +65,9 @@ if [ "$HOTSPOT_ACTIVE" = true ]; then
   HOTSPOT_GATEWAY_IP=$(nmcli -g IP4.ADDRESS device show "$WIFI_IFACE" 2>/dev/null | cut -d/ -f1)
   HOTSPOT_GATEWAY_IP="${HOTSPOT_GATEWAY_IP:-10.42.0.1}"
   HOTSPOT_LINES=(
-    -fill '#94a3b8' -font DejaVu-Sans -pointsize 30 -annotate +0+420 '2. Scan the QR code below to join its temporary Wi-Fi'
-    -fill '#94a3b8' -font DejaVu-Sans -pointsize 26 -annotate +0+460 "   Network: $HOTSPOT_SSID   Password: $HOTSPOT_PASSWORD"
-    -fill '#94a3b8' -font DejaVu-Sans -pointsize 30 -annotate +0+510 "3. Open http://$HOTSPOT_GATEWAY_IP:8080 and update the Wi-Fi network/password"
+    -fill '#94a3b8' -font DejaVu-Sans -pointsize 30 -annotate +0+460 '2. Scan the QR code below to join its temporary Wi-Fi'
+    -fill '#94a3b8' -font DejaVu-Sans -pointsize 26 -annotate +0+500 "   Network: $HOTSPOT_SSID   Password: $HOTSPOT_PASSWORD"
+    -fill '#94a3b8' -font DejaVu-Sans -pointsize 30 -annotate +0+550 "3. Open http://$HOTSPOT_GATEWAY_IP:8080 and update the Wi-Fi network/password"
   )
 else
   # Between retries, right after this device grabbed the radio back to
@@ -75,7 +75,7 @@ else
   # CHECK_INTERVAL_SECONDS if that attempt fails again. No QR code to show
   # in this brief window since there's nothing to join yet.
   HOTSPOT_LINES=(
-    -fill '#94a3b8' -font DejaVu-Sans -pointsize 30 -annotate +0+420 '2. Retrying now — the setup hotspot will reappear here shortly if it fails again'
+    -fill '#94a3b8' -font DejaVu-Sans -pointsize 30 -annotate +0+460 '2. Retrying now — the setup hotspot will reappear here shortly if it fails again'
   )
 
 fi

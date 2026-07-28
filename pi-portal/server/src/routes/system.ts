@@ -219,13 +219,28 @@ function writeMulticastConfig(config: MulticastConfig): void {
 }
 
 // Lists real NICs for the multicast interface dropdown (see MULTICAST_INTERFACE
-// / player.sh's --miface) — loopback and anything with no live address (down,
-// unplugged) filtered out, since neither is a sane multicast egress choice.
+// / player.sh's --miface). Was `os.networkInterfaces()` filtered to
+// addresses-currently-bound — which excludes a real, physically-present
+// interface like an eth0 with no cable plugged in yet (no link, no DHCP
+// lease, no address at all), even though picking that interface ahead of
+// time for a not-yet-connected multicast feed is a legitimate thing to want
+// to do. sync.sh's own network-interfaces report (sent up to the cloud,
+// which is why the SaaS-side multicast dropdown for the same device didn't
+// have this problem) enumerates /sys/class/net directly instead — no
+// address requirement, just filtering out loopback and virtual interfaces.
+// Mirrored here so both dropdowns agree.
 function listNetworkInterfaces(): string[] {
-  const nets = os.networkInterfaces()
-  return Object.entries(nets)
-    .filter(([name, addrs]) => name !== 'lo' && addrs?.some((a) => !a.internal))
-    .map(([name]) => name)
+  let names: string[]
+  try {
+    names = fs.readdirSync('/sys/class/net')
+  } catch {
+    // Not on Linux (local dev off a real Pi) — fall back to the old
+    // address-bound view rather than returning nothing.
+    return Object.entries(os.networkInterfaces())
+      .filter(([name, addrs]) => name !== 'lo' && addrs?.some((a) => !a.internal))
+      .map(([name]) => name)
+  }
+  return names.filter((name) => !/^(lo|veth|docker|br-|tun|tap)/.test(name))
 }
 
 // Must match wifi-ap-fallback.sh's own HOTSPOT_CONN_NAME — duplicated
@@ -431,7 +446,12 @@ export default async function systemRoutes(app: FastifyInstance) {
 
   /** POST /api/system/hostname */
   app.post('/hostname', async (request, reply) => {
-    const body = z.object({ hostname: z.string().regex(/^[a-z0-9-]{1,63}$/i, 'Letters, numbers, hyphens only') }).safeParse(request.body)
+    // Was `^[a-z0-9-]{1,63}$` — looser than what hostnamectl/systemd itself
+    // accepts (RFC 1123: no leading/trailing hyphen). A value that passed
+    // this validation could still get rejected by `hostnamectl` downstream,
+    // surfacing as a generic "Could not set the hostname" with no clue why —
+    // confirmed as the likely cause of exactly that QA report.
+    const body = z.object({ hostname: z.string().regex(/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i, 'Letters, numbers, hyphens only — cannot start or end with a hyphen') }).safeParse(request.body)
     if (!body.success) return reply.code(400).send({ error: body.error.flatten() })
     try {
       await execFile('sudo', ['-n', 'hostnamectl', 'set-hostname', body.data.hostname])
@@ -631,6 +651,48 @@ export default async function systemRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: 'Could not extract that file — is it a valid .tar.gz?' })
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  /**
+   * POST /api/system/factory-reset — the local-portal equivalent of the
+   * cloud's Factory Reset action, for a device with no cloud connection (or
+   * one being reset before it's ever claimed). Runs factory-reset.sh
+   * verbatim rather than reimplementing its steps here — see that script's
+   * own header comment for why it exists as a single source of truth.
+   *
+   * Deliberately has NO "release this device" option: that's a cloud-side
+   * Device-record deletion this local script has no way to perform (see
+   * factory-reset.sh's own comment on that boundary) — un-claiming a device
+   * still has to happen from the SaaS/Platform Admin side.
+   */
+  app.post('/factory-reset', async (request, reply) => {
+    const body = z.object({ forgetWifi: z.boolean().default(false) }).safeParse(request.body)
+    if (!body.success) return reply.code(400).send({ error: body.error.flatten() })
+
+    const args = [path.join(SITESTREAM_DIR, 'factory-reset.sh'), '--yes']
+    if (body.data.forgetWifi) args.push('--forget-wifi')
+
+    // Fire-and-forget, same shape as /firmware/upload above — factory-reset.sh
+    // restarts sitestream-portal.service itself partway through (to release
+    // the sqlite file it just deleted), which would kill this very request
+    // if awaited.
+    execFile('bash', args)
+      .then(() => {
+        // Forgetting Wi-Fi can leave the radio stuck until a full reboot, not
+        // just a service restart (factory-reset.sh's own --forget-wifi exit
+        // message says as much). Nobody's at a terminal on a field unit to
+        // read that suggestion and act on it, so mirror sync.sh's own
+        // cloud-triggered reset path and reboot automatically instead.
+        if (body.data.forgetWifi) return execFile('sudo', ['-n', 'systemctl', 'reboot'])
+      })
+      .catch((err) => logExecFailure(request.log, 'POST /factory-reset', err))
+
+    return {
+      ok: true,
+      message: body.data.forgetWifi
+        ? 'Factory reset started — this device will forget its Wi-Fi network and reboot in a few seconds.'
+        : 'Factory reset started — this device is restarting its services now.',
     }
   })
 }
