@@ -103,6 +103,7 @@ export interface SystemInfo {
   ntpSynced: boolean
   currentTime: string
   installedVersion: string | null
+  nextCheckinAt: string | null
   // Raspberry Pi OS soft-blocks the radio via rfkill until a regulatory
   // country is set — a device that's never been through that can't scan or
   // join anything at all until it is. See system.ts's isWifiRadioBlocked.

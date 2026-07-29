@@ -135,13 +135,27 @@ wlan0_fully_connected() {
 }
 
 # Ethernet has no hotspot-name ambiguity to worry about, so the original
-# "busy or connected" (state 40-100) range is still the right check — a
-# device already fully reachable over a wired connection, or actively
-# getting a DHCP lease, has no need for the WiFi setup hotspot either.
+# "busy or connected" (state 40-100) range is still a fine cheap pre-filter
+# — but it's NOT sufficient on its own anymore. A link-local/APIPA-only
+# address (169.254.x.x, from the ipv4.link-local fallback install.sh now
+# enables for isolated multicast segments — see that install.sh comment)
+# reports the exact same state-100 "activated" code as a real DHCP-assigned
+# address with full internet access; state 100 just means "IP config
+# completed successfully by SOME method," and link-local counts. Confirmed
+# live in QA: ethernet plugged into a switch with no real path anywhere
+# (link-local address, no gateway) made this function return true, which
+# skipped the Wi-Fi rescue hotspot entirely and left the device fully
+# stranded — worse than before the link-local fallback existed, since eth0
+# used to correctly get NO address at all in that exact scenario. A
+# link-local address structurally never has a default gateway (that's the
+# definition of link-local), so requiring one is a cheap, local, direct
+# check for "this interface can actually reach something" rather than just
+# "this interface has some address."
 eth0_connected() {
   local code
   code=$(nmcli -t -f GENERAL.STATE device show eth0 2>/dev/null | cut -d: -f2 | grep -o '^[0-9]*')
-  [ -n "$code" ] && [ "$code" -ge 40 ] && [ "$code" -le 100 ]
+  [ -n "$code" ] && [ "$code" -ge 40 ] && [ "$code" -le 100 ] || return 1
+  ip route show default dev eth0 2>/dev/null | grep -q .
 }
 
 hotspot_active() {

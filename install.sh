@@ -103,7 +103,7 @@ fi
 # Node (for the standalone-mode local portal, pi-portal/) is NOT in this
 # list — handled entirely in its own section above, since which install
 # method even works depends on CPU architecture (see there for why).
-PACKAGES_TO_INSTALL="vlc jq curl cron logrotate qrencode imagemagick fonts-dejavu-core"
+PACKAGES_TO_INSTALL="vlc jq curl cron logrotate qrencode imagemagick fonts-dejavu-core ffmpeg"
 NEWLY_INSTALLED_PACKAGES=""
 for pkg in $PACKAGES_TO_INSTALL; do
   dpkg -s "$pkg" >/dev/null 2>&1 || NEWLY_INSTALLED_PACKAGES="$NEWLY_INSTALLED_PACKAGES $pkg"
@@ -480,6 +480,48 @@ EOF
 systemctl daemon-reload
 systemctl enable sitestream-wifi-ap.service
 systemctl restart sitestream-wifi-ap.service
+
+# ── Ethernet link-local (APIPA) fallback for multicast-only deployments ───────
+# Confirmed live on real hardware: NetworkManager's `ipv4.method=auto` does
+# NOT automatically fall back to an RFC 3927 link-local (169.254.x.x) address
+# when no DHCP server answers — that's a common assumption (including one
+# briefly made while debugging this very issue) but the actual NetworkManager
+# behavior is that `ipv4.link-local` defaults to effectively disabled and has
+# to be explicitly turned on. Without this, an eth0 plugged into an isolated
+# multicast/AV segment with no DHCP server gets NO IPv4 address at all —
+# which meant player.sh's multicast output silently fell back to sending out
+# whatever OTHER interface (e.g. wlan0, this device's own SaaS connection)
+# happened to have a working address, onto the wrong network entirely, with
+# nothing in any log to say so. Only touches the wired connection's IPv4
+# fallback behavior — has no effect at all on a network that DOES have DHCP,
+# since DHCP is still tried first either way.
+if command -v nmcli >/dev/null 2>&1; then
+  ETH_CONN=$(nmcli -t -f NAME,TYPE connection show 2>/dev/null | awk -F: '$2 == "802-3-ethernet" { print $1; exit }')
+  if [ -n "$ETH_CONN" ]; then
+    nmcli connection modify "$ETH_CONN" ipv4.link-local enabled
+    # ipv6.method=auto (the default) tries to get a routable IPv6 address via
+    # router advertisement — on an isolated segment with no IPv6 router, that
+    # can't succeed either. Confirmed live: with BOTH ipv4 and ipv6 unable to
+    # reach a "full" config on such a network, NetworkManager repeatedly
+    # failed the whole activation as ip-config-unavailable and tore the
+    # connection down every ~45s to retry from scratch — despite ipv4.may-fail
+    # and ipv6.may-fail both being yes, which should have let either side fail
+    # independently without sinking the activation, but empirically didn't.
+    # That 45s fail/reconnect loop is what was pulling the freshly-assigned
+    # link-local address out from under ffmpeg's multicast socket mid-stream
+    # ("Network is unreachable" a few seconds into playback, repeating).
+    # SiteStream doesn't use IPv6 for anything — pinning it to link-local-only
+    # (never attempts RA/DHCPv6, so nothing to fail) removes that variable
+    # entirely rather than continuing to fight NetworkManager's activation
+    # state machine over it.
+    nmcli connection modify "$ETH_CONN" ipv6.method link-local
+    # Best-effort reapply now (a device that's already up and just sitting on
+    # no IPv4 at all benefits immediately); the setting is saved into the
+    # connection profile regardless, so it also takes effect on the next
+    # normal activation (boot, replug) even if this particular call fails.
+    nmcli connection up "$ETH_CONN" >/dev/null 2>&1 || true
+  fi
+fi
 
 # ── Standalone-mode local portal service ──────────────────────────────────────
 # Always running (like the listener above), reachable at

@@ -11,6 +11,30 @@ const exec = promisify(execCb)
 const execFile = promisify(execFileCb)
 
 const INSTALLED_VERSION_FILE = path.join(SITESTREAM_DIR, '.installed_version')
+// Same files sync.sh itself writes (.last_sync_ok on every successful
+// manifest fetch, .sync_interval on every cron-schedule change) — reused
+// here rather than duplicated, so this always reflects sync.sh's own idea
+// of the cadence instead of a second, potentially-drifting copy of it.
+const LAST_SYNC_OK_FILE = path.join(SITESTREAM_DIR, '.last_sync_ok')
+const SYNC_INTERVAL_FILE = path.join(SITESTREAM_DIR, '.sync_interval')
+
+/** Requested in QA: a visible "next check-in" on the System tab, so a
+ * tester watching a sync-interval change (or just wondering if the device
+ * is stuck) doesn't have to guess. Null when we don't have enough state to
+ * compute it yet (never synced, or interval unknown) rather than a
+ * misleading guess. */
+function getNextCheckin(): string | null {
+  if (!fs.existsSync(LAST_SYNC_OK_FILE)) return null
+  const lastSyncOk = Number(fs.readFileSync(LAST_SYNC_OK_FILE, 'utf8').trim())
+  if (!Number.isFinite(lastSyncOk)) return null
+
+  const intervalMinutes = fs.existsSync(SYNC_INTERVAL_FILE)
+    ? Number(fs.readFileSync(SYNC_INTERVAL_FILE, 'utf8').trim())
+    : 15
+  if (!Number.isFinite(intervalMinutes)) return null
+
+  return new Date((lastSyncOk + intervalMinutes * 60) * 1000).toISOString()
+}
 
 // child_process errors carry stdout/stderr from the failed command, which is
 // exactly what's needed to actually diagnose a sudoers/permission/syntax
@@ -378,6 +402,7 @@ export default async function systemRoutes(app: FastifyInstance) {
       ntpSynced,
       currentTime: new Date().toISOString(),
       installedVersion,
+      nextCheckinAt: getNextCheckin(),
       wifiBlocked: await isWifiRadioBlocked(),
       wifi: await getWifiStatus(),
       multicast: getMulticastConfig(),
@@ -431,9 +456,23 @@ export default async function systemRoutes(app: FastifyInstance) {
     const body = z.object({ isoDatetime: z.string().min(1) }).safeParse(request.body)
     if (!body.success) return reply.code(400).send({ error: body.error.flatten() })
 
-    const dt = new Date(body.data.isoDatetime)
-    if (isNaN(dt.getTime())) return reply.code(400).send({ error: 'Invalid date/time' })
-    const formatted = dt.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '')
+    // isoDatetime comes straight from an HTML <input type="datetime-local">
+    // (SystemPanel.tsx) — a NAIVE local wall-clock string with no timezone,
+    // e.g. "2026-07-29T09:38". This used to go through `new Date(...)`
+    // (which treats a timezone-less string as local time, per the JS spec)
+    // and then `.toISOString()` (which converts TO UTC) before handing it to
+    // `timedatectl set-time` — but set-time interprets its argument as LOCAL
+    // time too, not UTC. That silently applied the zone's UTC offset a
+    // second time on the way into a command that already expected local
+    // time. Confirmed live: setting 9:38 AM in America/New_York (UTC-4)
+    // resulted in the clock reading 1:38 PM — exactly a 4-hour error, the
+    // zone's own offset. Fix: validate and reformat the string directly, no
+    // Date object and no timezone conversion in either direction — the
+    // wall-clock digits the user typed are exactly what should reach
+    // timedatectl, untouched.
+    const match = body.data.isoDatetime.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})(:\d{2})?$/)
+    if (!match) return reply.code(400).send({ error: 'Invalid date/time' })
+    const formatted = `${match[1]} ${match[2]}${match[3] ?? ':00'}`
 
     try {
       await execFile('sudo', ['-n', 'timedatectl', 'set-time', formatted])
@@ -542,17 +581,35 @@ export default async function systemRoutes(app: FastifyInstance) {
       return reply.code(409).send({ error: 'Wi-Fi radio is disabled — set a Wi-Fi country first, then try joining again.', wifiBlocked: true })
     }
 
-    try {
-      if (body.data.countryCode) {
+    if (body.data.countryCode) {
+      try {
         await execFile('sudo', ['-n', 'raspi-config', 'nonint', 'do_wifi_country', body.data.countryCode.toUpperCase()])
+      } catch (err) {
+        logExecFailure(request.log, 'POST /wifi/connect country', err)
+        return reply.code(500).send({ error: 'Could not set the Wi-Fi country' })
       }
-      await forgetExistingProfile(body.data.ssid)
-      await execFile('sudo', ['-n', 'raspi-config', 'nonint', 'do_wifi_ssid_passphrase', body.data.ssid, body.data.password ?? ''])
-      return { ok: true }
-    } catch (err) {
-      logExecFailure(request.log, 'POST /wifi/connect', err)
-      return reply.code(500).send({ error: 'Could not join that network — check the password and try again.' })
     }
+
+    // Fire-and-forget from here on — same reasoning as /firmware/upload and
+    // /factory-reset above, but confirmed live for a different concrete
+    // reason: if this device was reachable via its OWN setup hotspot (the
+    // common case), joining a DIFFERENT network can drop that hotspot —
+    // and the interface carrying THIS request — before do_wifi_ssid_
+    // passphrase (and the response after it) ever finished. That raced the
+    // response with the network change and surfaced as "Could not join
+    // that network" even on joins that fully succeeded, every time,
+    // reproduced across three separate QA rounds. Respond immediately
+    // instead — the 15s system-info poll (info.wifi.ssid, already wired up
+    // client-side) is the real source of truth for whether the join
+    // actually worked, not this request's own round-trip. Trade-off: a
+    // genuinely wrong password/SSID no longer surfaces as an explicit error
+    // toast, only as "still not connected" — acceptable since a false error
+    // on a successful join was strictly worse and happened far more often.
+    forgetExistingProfile(body.data.ssid)
+      .then(() => execFile('sudo', ['-n', 'raspi-config', 'nonint', 'do_wifi_ssid_passphrase', body.data.ssid, body.data.password ?? '']))
+      .catch((err) => logExecFailure(request.log, 'POST /wifi/connect join', err))
+
+    return { ok: true, message: `Joining "${body.data.ssid}"… this can take a few seconds.` }
   })
 
   /** GET /api/system/network-interfaces — populates the multicast interface picker */

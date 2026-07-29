@@ -12,23 +12,30 @@
 # never mentions cloud-claim status since it applies regardless of it.
 #
 # Idempotent by design, same pattern as generate-onboarding-screen.sh: skips
-# regenerating if the output already exists and this device's LAN IP hasn't
-# changed since the last time it was generated. Pass FORCE=1 to regenerate
-# anyway. Safe to call on every player.sh loop tick — the common case is a
-# fast no-op.
+# regenerating if the output already exists and neither this device's LAN IP
+# nor its claim state has changed since the last time it was generated. Pass
+# FORCE=1 to regenerate anyway. Safe to call on every player.sh loop tick —
+# the common case is a fast no-op.
 
 set -e
 
 SITESTREAM_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="$SITESTREAM_DIR/config.env"
 [ -f "$CONFIG" ] && source "$CONFIG"
+APP_URL="${APP_URL:-https://app.sitestream.app}"
 
 OUTPUT="$SITESTREAM_DIR/idle.png"
 CURRENT_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 
+# Claim state now affects rendered content (see PORTAL_LINE below), so it
+# has to be part of the cache key too — same reasoning as
+# generate-onboarding-screen.sh including HOTSPOT_ACTIVE in its own state
+# string. Without this, a device that gets claimed while already idle-
+# screen-cached at the same IP wouldn't regenerate until the IP happened to
+# change too, leaving the stale local-portal QR up indefinitely.
 STATE_CACHE_FILE="$SITESTREAM_DIR/.idle_state"
 CACHED_STATE=$(cat "$STATE_CACHE_FILE" 2>/dev/null || echo "")
-CURRENT_STATE="$CURRENT_IP"
+CURRENT_STATE="$CURRENT_IP:${DEVICE_TOKEN:+claimed}"
 
 if [ -f "$OUTPUT" ] && [ "$FORCE" != "1" ] && [ "$CURRENT_STATE" = "$CACHED_STATE" ]; then
   exit 0
@@ -39,12 +46,23 @@ SERIAL=$(awk -F': ' '/^Serial/ {print $2}' /proc/cpuinfo | tr -d ' \n')
 QR_PNG="$SITESTREAM_DIR/.idle_qr.png"
 BASE_PNG="$SITESTREAM_DIR/.idle_base.png"
 
-# Only mentioned/QR'd when pi-portal is actually part of this install (older
-# releases, or a device install.sh deliberately skipped it for, won't have
-# the directory at all) and this device actually has a LAN IP to point at —
-# no point advertising a URL nothing's listening on.
+# Was unconditional — always pointed at the local portal regardless of claim
+# state, even on a device that's fully cloud-managed. Confirmed in QA:
+# claimed device, nothing scheduled, idle screen still told the tester to
+# manage the schedule at the local portal's LAN IP instead of the SaaS —
+# stale standalone-mode messaging on a device that isn't standalone anymore.
+# Mirrors generate-onboarding-screen.sh's own claimed-vs-not branching
+# (that script needs no such check itself — player.sh only invokes it when
+# DEVICE_TOKEN is already empty).
 PORTAL_LINE=""
-if [ -d "$SITESTREAM_DIR/pi-portal" ] && [ -n "$CURRENT_IP" ]; then
+if [ -n "${DEVICE_TOKEN:-}" ]; then
+  PORTAL_LINE="Manage this device's schedule at $APP_URL"
+  qrencode -o "$QR_PNG" -s 10 -m 2 "$APP_URL/devices"
+elif [ -d "$SITESTREAM_DIR/pi-portal" ] && [ -n "$CURRENT_IP" ]; then
+  # Only mentioned/QR'd when pi-portal is actually part of this install
+  # (older releases, or a device install.sh deliberately skipped it for,
+  # won't have the directory at all) and this device actually has a LAN IP
+  # to point at — no point advertising a URL nothing's listening on.
   PORTAL_URL="http://$CURRENT_IP:8080"
   PORTAL_LINE="Manage this device's schedule at $PORTAL_URL"
   qrencode -o "$QR_PNG" -s 10 -m 2 "$PORTAL_URL"

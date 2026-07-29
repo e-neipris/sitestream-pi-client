@@ -6,9 +6,32 @@ import { useState, useEffect, useRef } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { systemApi } from '@/lib/api'
 
+function formatNextCheckin(nextCheckinAt: string | null | undefined): string {
+  if (!nextCheckinAt) return 'unknown (hasn\'t synced yet)'
+  const diffMinutes = Math.round((new Date(nextCheckinAt).getTime() - Date.now()) / 60_000)
+  if (diffMinutes <= 0) return 'due any moment'
+  if (diffMinutes === 1) return 'in ~1 min'
+  return `in ~${diffMinutes} min`
+}
+
 function apiErrorMessage(err: any, fallback: string): string {
   const data = err?.response?.data?.error
-  return typeof data === 'string' ? data : fallback
+  if (typeof data === 'string') return data
+  // A failed zod .safeParse() (e.g. the hostname regex) sends back
+  // .flatten()'s shape — { formErrors, fieldErrors } — not a plain string,
+  // so the check above always missed it and silently fell back to a generic
+  // "Could not set X" with no explanation of what was actually wrong.
+  // Confirmed as exactly why "Could not set hostname" gave no hint that
+  // hostnames can't contain spaces, even though the server-side message
+  // (below) already explains the real rule.
+  if (data && typeof data === 'object') {
+    const parts = [
+      ...(data.formErrors ?? []),
+      ...Object.entries(data.fieldErrors ?? {}).map(([field, msgs]) => `${field}: ${(msgs as string[]).join(', ')}`),
+    ]
+    if (parts.length) return parts.join('; ')
+  }
+  return fallback
 }
 
 export default function SystemPanel() {
@@ -181,6 +204,10 @@ function SettingsView() {
             value={info ? new Date(info.currentTime).toLocaleString(undefined, info.timezone ? { timeZone: info.timezone } : undefined) : '—'}
             valueColor={info?.ntpEnabled ? (info?.ntpSynced ? '#22c55e' : '#f59e0b') : '#94a3b8'}
             sub={info ? `NTP ${info.ntpEnabled ? (info.ntpSynced ? 'synced' : 'syncing…') : 'off'}` : undefined}
+          />
+          <Stat
+            label="Next Check-in"
+            value={formatNextCheckin(info?.nextCheckinAt)}
           />
         </div>
       </div>

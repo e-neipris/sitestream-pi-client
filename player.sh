@@ -192,46 +192,66 @@ start_multicast() {
   if [ "$MULTICAST_ENABLED" != "true" ] || [ -z "$MULTICAST_ADDRESS" ] || [ -z "$MULTICAST_PORT" ]; then
     return
   fi
-  # --miface pins which NIC actually transmits the multicast packets,
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    log "ERROR: ffmpeg not installed — cannot start multicast output. Re-run install.sh (or apply a firmware update) to pick it up."
+    return
+  fi
+
+  # localaddr= pins which NIC actually transmits the multicast packets,
   # overriding whatever the kernel's own routing table would otherwise pick
   # — needed the moment this device also uses a different interface (e.g.
-  # wlan0) for its own SaaS traffic, so multicast doesn't silently try to
-  # go out that one instead of the wired ingestion port. Confirmed against
-  # this VLC build via `cvlc --advanced --longhelp | grep -A4 miface`
-  # ("Multicast output interface") before wiring this in. Empty/unset
-  # (the common case) omits the flag entirely — same as before this existed.
-  MIFACE_ARGS=()
+  # wlan0) for its own SaaS traffic, so multicast doesn't silently try to go
+  # out that one instead of the wired ingestion port. ffmpeg's udp muxer
+  # takes a bind IP, not an interface name (unlike VLC's old --miface) — so
+  # resolve MULTICAST_INTERFACE to its current IPv4 address here. Empty/unset
+  # (the common case), or a lookup failure, just omits the param — same
+  # "let the OS decide" behavior as before this existed.
+  LOCALADDR_QS=""
   if [ -n "$MULTICAST_INTERFACE" ]; then
-    MIFACE_ARGS=(--miface "$MULTICAST_INTERFACE")
+    IFACE_IP=$(ip -4 -o addr show "$MULTICAST_INTERFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    if [ -n "$IFACE_IP" ]; then
+      LOCALADDR_QS="&localaddr=$IFACE_IP"
+    else
+      log "WARN: could not resolve an IPv4 address for multicast interface '$MULTICAST_INTERFACE' — letting the OS pick the outgoing interface instead."
+    fi
   fi
+
   log "Starting multicast output: udp://$MULTICAST_ADDRESS:$MULTICAST_PORT${MULTICAST_INTERFACE:+ via $MULTICAST_INTERFACE}"
-  # No transcode{} stanza — this remuxes the existing H.264 MP4 into MPEG-TS
-  # rather than re-encoding it, which is what sync.sh downloads today. Revisit
-  # this once you have the tuner manufacturer's exact ingest spec.
+  # -c copy: remux the existing H.264 MP4 into MPEG-TS rather than
+  # re-encoding it, which is what sync.sh downloads today. Revisit this once
+  # you have the tuner manufacturer's exact ingest spec.
   #
-  # --aout alsa: VLC opens a local audio output for the input's audio track
-  # even on a pure remux with no display branch — confirmed by testing, not
-  # assumed. Left at its default (PulseAudio auto-probe), that open fails in
-  # this context (a systemd system service has no desktop session for
-  # PulseAudio's socket), the same failure seen on the display process.
-  # ALSA talks to the kernel sound driver directly and doesn't need one.
-  # Logging added here for the first time (this process previously had none)
-  # specifically so an audio failure on the path that actually matters — the
-  # multicast stream a hospitality TV system ingests — is visible instead of
-  # silent.
-  cvlc \
-    --intf dummy \
-    --vout dummy \
-    --aout alsa \
-    --loop \
-    "${MIFACE_ARGS[@]}" \
-    --sout "#std{access=udp,mux=ts,dst=$MULTICAST_ADDRESS:$MULTICAST_PORT}" \
-    --sout-keep \
-    --extraintf logger \
-    --file-logging \
-    --logfile "$SITESTREAM_DIR/logs/vlc-multicast.log" \
-    --verbose 1 \
-    "$video_path" &
+  # Switched from VLC to ffmpeg here (VLC still drives the HDMI display
+  # process above, untouched) after confirming live, on real hardware, that
+  # VLC's own loop mechanism — --loop AND --input-repeat both — corrupts the
+  # TS mux's PCR/DTS at every wraparound ("putting two PCRs at once", "packet
+  # with too strange dts" firing exactly once per video-length interval,
+  # reproduced on two different test files). A receiving player got the UDP
+  # packets fine but could never demux a valid container out of them. ffmpeg
+  # is the standard, purpose-built tool for exactly this "loop a file forever
+  # to a live stream" case and regenerates continuous timestamps across the
+  # loop boundary instead of restarting the clock.
+  #
+  # -re: read the input at its native frame rate. Without this, ffmpeg (with
+  # no decode step to naturally pace it, same reason VLC needed forcing here
+  # too) reads and remuxes the file as fast as disk I/O allows — a burst of
+  # the whole video at once instead of paced real-time delivery.
+  # -stream_loop -1: loop forever, ffmpeg's own native mechanism (built for
+  # this, unlike VLC's) — no --sout-keep-style workaround needed.
+  # pkt_size=1316: 7 TS packets (7*188B) per UDP datagram — the standard,
+  # widely-used size for MPEG-TS-over-UDP that keeps payloads under typical
+  # MTU and aligned to TS packet boundaries; matters for compatibility with
+  # real IPTV tuner hardware, the eventual actual consumer of this stream.
+  # ttl=32: multicast packets default to TTL 1 (one hop) on most stacks,
+  # which silently dies at the first router/VLAN boundary between this
+  # device and whatever's watching — set explicitly rather than relying on
+  # a default that only works when sender and receiver share one L2 segment.
+  ffmpeg -nostdin -hide_banner -loglevel warning \
+    -re -stream_loop -1 -i "$video_path" \
+    -c copy \
+    -f mpegts \
+    "udp://$MULTICAST_ADDRESS:$MULTICAST_PORT?ttl=32&pkt_size=1316${LOCALADDR_QS}" \
+    >>"$SITESTREAM_DIR/logs/vlc-multicast.log" 2>&1 &
   MULTICAST_PID=$!
 }
 
@@ -559,13 +579,23 @@ while true; do
       log "Connectivity restored — removing on-screen indicator."
     fi
     start_vlc "$WANTED" "" "$OVERLAY_WANT"
-  elif [ "$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT" != "$CURRENT_MULTICAST_TARGET" ]; then
-    # Same video, same display process — only the multicast config changed
-    # (or was toggled on/off). Restarting just that process doesn't touch
-    # the live display at all. Logged only when it's actually enabled —
-    # otherwise this fires every tick for a device with multicast off
-    # (nothing to report; start_multicast() no-ops) and reads as if a
-    # stream is being started when none ever is.
+  elif [ "$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT:$MULTICAST_INTERFACE" != "$CURRENT_MULTICAST_TARGET" ]; then
+    # Was missing ":$MULTICAST_INTERFACE" on this side of the comparison —
+    # CURRENT_MULTICAST_TARGET is always stored as all FOUR fields (see
+    # start_multicast's own assignment), so this could never match as long
+    # as multicast was enabled at all, even with no config change and no
+    # interface selected (the trailing ":" alone made the strings differ).
+    # Confirmed live: this silently force-restarted the multicast process on
+    # EVERY 30s main-loop tick, forever — invisible on a short test clip
+    # (indistinguishable from the video's own normal loop), but very visible
+    # on a real multi-minute video, which never got to play past ~30s before
+    # being torn down and relaunched from the beginning again. Same video,
+    # same display process — only the multicast config changed (or was
+    # toggled on/off). Restarting just that process doesn't touch the live
+    # display at all. Logged only when it's actually enabled — otherwise
+    # this fires every tick for a device with multicast off (nothing to
+    # report; start_multicast() no-ops) and reads as if a stream is being
+    # started when none ever is.
     if [ "$MULTICAST_ENABLED" = "true" ] && [ -n "$MULTICAST_ADDRESS" ] && [ -n "$MULTICAST_PORT" ]; then
       log "Multicast config changed — restarting multicast output for: $WANTED"
     fi
