@@ -291,6 +291,51 @@ if [ "$MANIFEST_HTTP_CODE" = "401" ] && echo "$MANIFEST" | jq -e '.error == "dev
   exit 0
 fi
 
+# Any other 401 means DEVICE_TOKEN itself was rejected (expired — these are
+# long-lived but not infinite, see JWT_DEVICE_EXPIRES_IN — or otherwise
+# invalid) while the device is still claimed. Re-checkin with the hardware
+# serial (same call as zero-touch provisioning above) gets a fresh token for
+# the *same* device row — /checkin is keyed off serial number, not the old
+# token, so this works even though the very credential we're replacing is
+# what just failed. Without this, a device would silently stop picking up
+# schedule/firmware changes forever the day its token expires, with nothing
+# in the field to notice besides a log line nobody's watching.
+if [ "$MANIFEST_HTTP_CODE" = "401" ]; then
+  log "Device token rejected (expired or invalid) — re-checking in to get a fresh one."
+  SERIAL="${SERIAL:-$(awk -F': ' '/^Serial/ {print $2}' /proc/cpuinfo | tr -d ' \n')}"
+  REHEAL_RESPONSE=$(curl -sf -X POST -H "Content-Type: application/json" \
+    -d "{\"serialNumber\":\"$SERIAL\"}" --max-time 15 \
+    "$API_URL/api/devices/checkin") || {
+    log "ERROR: Re-checkin failed (API unreachable). Retaining existing schedule."
+    apply_sync_interval 1
+    exit 0
+  }
+  NEW_TOKEN=$(echo "$REHEAL_RESPONSE" | jq -r '.token // empty')
+  if [ -z "$NEW_TOKEN" ]; then
+    log "ERROR: Re-checkin didn't return a token (device may no longer be claimed). Retaining existing schedule."
+    apply_sync_interval 1
+    exit 0
+  fi
+  DEVICE_TOKEN="$NEW_TOKEN"
+  grep -v '^DEVICE_TOKEN=' "$CONFIG" 2>/dev/null > "$CONFIG.tmp" || true
+  echo "DEVICE_TOKEN=$DEVICE_TOKEN" >> "$CONFIG.tmp"
+  mv "$CONFIG.tmp" "$CONFIG"
+  chmod 600 "$CONFIG"
+  log "Got a fresh token — retrying manifest fetch."
+  MANIFEST_RAW=$(curl -s \
+    -H "Authorization: Bearer $DEVICE_TOKEN" \
+    -H "Accept: application/json" \
+    --max-time 30 \
+    -w '\n%{http_code}' \
+    "$API_URL/api/manifest") || {
+    log "ERROR: Failed to fetch manifest (network error). Retaining existing schedule."
+    apply_sync_interval 1
+    exit 0
+  }
+  MANIFEST_HTTP_CODE=$(echo "$MANIFEST_RAW" | tail -n1)
+  MANIFEST=$(echo "$MANIFEST_RAW" | sed '$d')
+fi
+
 if [ "$MANIFEST_HTTP_CODE" != "200" ]; then
   log "ERROR: Failed to fetch manifest (HTTP $MANIFEST_HTTP_CODE). Retaining existing schedule."
   apply_sync_interval 1
