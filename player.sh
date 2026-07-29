@@ -484,13 +484,24 @@ while true; do
     # is useless anyway in this state: there's no network route out of this
     # device at all until the Wi-Fi problem is fixed.
     SCREEN_IMAGE=""
-    if [ -f "$SITESTREAM_DIR/.wifi_rescue_state" ]; then
+    SCREEN_LOG_MSG=""
+    # A portal-initiated Wi-Fi join in progress takes priority over
+    # everything below — see generate-wifi-connecting-screen.sh's own
+    # comment for why this is checked (and ages out) independently of the
+    # rescue-mode state right under it.
+    if [ -f "$SITESTREAM_DIR/.wifi_connecting" ]; then
+      "$SITESTREAM_DIR/generate-wifi-connecting-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
+      [ -f "$SITESTREAM_DIR/wifi-connecting.png" ] && SCREEN_IMAGE="$SITESTREAM_DIR/wifi-connecting.png"
+    fi
+    if [ -n "$SCREEN_IMAGE" ]; then
+      SCREEN_LOG_MSG="Wi-Fi join in progress — showing connecting screen."
+    elif [ -f "$SITESTREAM_DIR/.wifi_rescue_state" ]; then
       "$SITESTREAM_DIR/generate-wifi-rescue-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
       [ -f "$SITESTREAM_DIR/wifi-rescue.png" ] && SCREEN_IMAGE="$SITESTREAM_DIR/wifi-rescue.png"
     fi
-    if [ -n "$SCREEN_IMAGE" ]; then
+    if [ -n "$SCREEN_IMAGE" ] && [ -z "$SCREEN_LOG_MSG" ]; then
       SCREEN_LOG_MSG="Configured Wi-Fi network can't connect — showing rescue screen (hotspot + retry info)."
-    else
+    elif [ -z "$SCREEN_IMAGE" ]; then
       "$SITESTREAM_DIR/generate-onboarding-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
       SCREEN_IMAGE="$SITESTREAM_DIR/onboarding.png"
       SCREEN_LOG_MSG="Not yet claimed — showing onboarding screen (serial + QR code)."
@@ -529,13 +540,24 @@ while true; do
     # looking at the screen how to fix it, not just show the generic
     # "nothing scheduled" idle screen.
     IDLE_IMAGE=""
-    if [ -f "$SITESTREAM_DIR/.wifi_rescue_state" ]; then
+    IDLE_LOG_MSG=""
+    # A portal-initiated Wi-Fi join in progress takes priority over
+    # everything below — see generate-wifi-connecting-screen.sh's own
+    # comment for why this is checked (and ages out) independently of the
+    # rescue-mode state right under it. Mirrors the onboarding branch above.
+    if [ -f "$SITESTREAM_DIR/.wifi_connecting" ]; then
+      "$SITESTREAM_DIR/generate-wifi-connecting-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
+      [ -f "$SITESTREAM_DIR/wifi-connecting.png" ] && IDLE_IMAGE="$SITESTREAM_DIR/wifi-connecting.png"
+    fi
+    if [ -n "$IDLE_IMAGE" ]; then
+      IDLE_LOG_MSG="Wi-Fi join in progress — showing connecting screen."
+    elif [ -f "$SITESTREAM_DIR/.wifi_rescue_state" ]; then
       "$SITESTREAM_DIR/generate-wifi-rescue-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
       [ -f "$SITESTREAM_DIR/wifi-rescue.png" ] && IDLE_IMAGE="$SITESTREAM_DIR/wifi-rescue.png"
     fi
-    if [ -n "$IDLE_IMAGE" ]; then
+    if [ -n "$IDLE_IMAGE" ] && [ -z "$IDLE_LOG_MSG" ]; then
       IDLE_LOG_MSG="Configured Wi-Fi network can't connect — showing rescue screen (hotspot + retry info)."
-    else
+    elif [ -z "$IDLE_IMAGE" ]; then
       "$SITESTREAM_DIR/generate-idle-screen.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
       IDLE_IMAGE="$SITESTREAM_DIR/idle.png"
       IDLE_LOG_MSG="No video scheduled — showing idle screen."

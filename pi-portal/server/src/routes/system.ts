@@ -590,6 +590,22 @@ export default async function systemRoutes(app: FastifyInstance) {
       }
     }
 
+    // Written BEFORE the fire-and-forget join kicks off — player.sh polls
+    // for this (see generate-wifi-connecting-screen.sh) so the physical
+    // display shows "Connecting to <SSID>…" instead of just sitting on the
+    // plain onboarding/rescue screen with no indication a join is even in
+    // progress. Same sourceable KEY=VALUE format as wifi-ap-fallback.sh's
+    // own .wifi_rescue_state, for the same reason: the generator script
+    // reads its own state directly rather than needing it threaded through
+    // as an argument. Freshness (not an explicit clear) is what ages this
+    // out — see that generator script's own comment for why.
+    try {
+      fs.writeFileSync(path.join(SITESTREAM_DIR, '.wifi_connecting'), `SSID=${body.data.ssid}\n`)
+    } catch {
+      // Non-fatal — worst case the connecting screen just doesn't show;
+      // the join itself doesn't depend on this file existing.
+    }
+
     // Fire-and-forget from here on — same reasoning as /firmware/upload and
     // /factory-reset above, but confirmed live for a different concrete
     // reason: if this device was reachable via its OWN setup hotspot (the
