@@ -625,7 +625,7 @@ export default async function systemRoutes(app: FastifyInstance) {
       .then(() => execFile('sudo', ['-n', 'raspi-config', 'nonint', 'do_wifi_ssid_passphrase', body.data.ssid, body.data.password ?? '']))
       .catch((err) => logExecFailure(request.log, 'POST /wifi/connect join', err))
 
-    return { ok: true, message: `Joining "${body.data.ssid}"… this can take a few seconds.` }
+    return { ok: true, message: `Joining "${body.data.ssid}"… this can take a few minutes.` }
   })
 
   /** GET /api/system/network-interfaces — populates the multicast interface picker */

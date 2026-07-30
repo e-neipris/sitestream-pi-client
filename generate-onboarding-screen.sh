@@ -29,7 +29,10 @@ CONFIG="$SITESTREAM_DIR/config.env"
 APP_URL="${APP_URL:-https://app.sitestream.app}"
 OUTPUT="$SITESTREAM_DIR/onboarding.png"
 
-CURRENT_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# Prefer a real address over a stale 169.254.x.x link-local one when an
+# interface holds both at once — see sync.sh's own comment on this same fix.
+CURRENT_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^169\.254\.' | head -1)
+[ -z "$CURRENT_IP" ] && CURRENT_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 
 # Mirrors wifi-ap-fallback.sh's own hotspot_active() check exactly — this
 # has to agree with that script about whether the hotspot is actually up,

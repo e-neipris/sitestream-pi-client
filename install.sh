@@ -653,7 +653,10 @@ SERIAL=$(awk -F': ' '/^Serial/ {print $2}' /proc/cpuinfo | tr -d ' \n')
 # to it, so sync.sh never actually runs again after this first call.
 sudo -u "$PI_USER" bash -c "'$PI_HOME/sitestream/sync.sh' >> '$PI_HOME/sitestream/logs/sync.log' 2>&1" || true
 
-PI_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# Prefer a real address over a stale 169.254.x.x link-local one when an
+# interface holds both at once — see sync.sh's own comment on this same fix.
+PI_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^169\.254\.' | head -1)
+[ -z "$PI_IP" ] && PI_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 
 echo ""
 echo "=== Setup complete ==="

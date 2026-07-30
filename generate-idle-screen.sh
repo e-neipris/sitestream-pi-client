@@ -25,7 +25,13 @@ CONFIG="$SITESTREAM_DIR/config.env"
 APP_URL="${APP_URL:-https://app.sitestream.app}"
 
 OUTPUT="$SITESTREAM_DIR/idle.png"
-CURRENT_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+# Prefer a real address over a stale 169.254.x.x link-local one when an
+# interface holds both at once (e.g. eth0 after DHCP comes back — see
+# sync.sh's own comment on this same fix) — only fall back to whatever's
+# first if nothing else exists, so a genuine no-DHCP device still shows
+# something rather than a blank IP.
+CURRENT_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^169\.254\.' | head -1)
+[ -z "$CURRENT_IP" ] && CURRENT_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 
 # Claim state now affects rendered content (see PORTAL_LINE below), so it
 # has to be part of the cache key too — same reasoning as

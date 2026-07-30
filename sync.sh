@@ -616,7 +616,19 @@ echo "$MANIFEST" | jq --arg videoDir "$VIDEO_DIR" '{
 log "Schedule written to $SCHEDULE_FILE"
 
 # ── 5. Heartbeat — report confirmed manifest hash + health telemetry ──────────
-IP_ADDRESS=$(hostname -I | awk '{print $1}')
+# `hostname -I` lists every address on every interface, in whatever order the
+# kernel happens to return them — not necessarily "the real one first". An
+# interface can legitimately hold more than one address at once: eth0 with
+# DHCP re-enabled after running without it for a while still keeps the
+# 169.254.x.x link-local address install.sh's ipv4.link-local fallback
+# assigned earlier (see that script), alongside the new DHCP lease, until the
+# next reboot/reconnect. Confirmed live: this device reported its stale
+# 169.254.x.x address to the SaaS as its "current" IP long after getting a
+# real one. Prefer any non-link-local answer; only fall back to whatever's
+# first (even if that's 169.254.x.x) for the genuine no-DHCP-at-all case this
+# fallback exists for in the first place, so this never reports nothing.
+IP_ADDRESS=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^169\.254\.' | head -1)
+[ -z "$IP_ADDRESS" ] && IP_ADDRESS=$(hostname -I 2>/dev/null | awk '{print $1}')
 INSTALLED_VERSION_FILE="$SITESTREAM_DIR/.installed_version"
 INSTALLED_VERSION=$(cat "$INSTALLED_VERSION_FILE" 2>/dev/null || echo "")
 
