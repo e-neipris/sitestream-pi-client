@@ -25,6 +25,18 @@ CURRENT_VIDEO_PATH=""
 # separately from CURRENT_VIDEO_PATH (which only tells us the path is the
 # same, not that the content behind it is still the same).
 CURRENT_STATIC_IMAGE_MTIME=""
+# Same blind spot as CURRENT_STATIC_IMAGE_MTIME above, but for a real
+# scheduled video rather than the onboarding/idle screens: an SFTP re-upload
+# overwrites a zone's existing VideoFile in place (see mediaSlot.ts) — same
+# VideoFile id, same local path sync.sh downloads it to ($VIDEO_DIR/$videoId.mp4)
+# — so WANTED never changes even though the bytes on disk did. Without this,
+# VLC (already holding the old file open, --loop'd) just kept looping the
+# stale content forever; sync.sh's own atomic `mv` onto that path doesn't
+# affect a process that already has the old inode open by fd. Confirmed live:
+# the immediate-push feature correctly woke the device and re-downloaded the
+# new file within seconds, but the old video kept playing regardless since
+# nothing here noticed.
+CURRENT_VIDEO_MTIME=""
 CURRENT_MULTICAST_TARGET=""
 # What VLC was actually last started with — "disconnected" or "" — so a
 # transition can be detected and acted on (see is_disconnected below), same
@@ -302,9 +314,10 @@ is_disconnected() {
   [ $(( $(date +%s) - last_ok )) -gt $(( threshold_min * 60 )) ]
 }
 
-# Used only for the onboarding/idle static-image screens — see
-# CURRENT_STATIC_IMAGE_MTIME above for why path-equality alone isn't enough
-# to know whether VLC needs to be told to reload.
+# Used for the onboarding/idle static-image screens AND real scheduled video
+# — see CURRENT_STATIC_IMAGE_MTIME/CURRENT_VIDEO_MTIME above for why
+# path-equality alone isn't enough to know whether VLC needs to be told to
+# reload.
 get_mtime() {
   stat -c '%Y' "$1" 2>/dev/null
 }
@@ -402,6 +415,7 @@ start_vlc() {
     "$video_path" &
   VLC_PID=$!
   CURRENT_VIDEO_PATH="$video_path"
+  CURRENT_VIDEO_MTIME=$(get_mtime "$video_path")
   CURRENT_OVERLAY_STATE="$show_disconnected"
   LAST_VLC_TIME=""
   LAST_DISPLAYED_PICTURES="0"
@@ -580,8 +594,20 @@ while true; do
     fi
   elif [ ! -f "$WANTED" ]; then
     log "WARN: Scheduled video not found locally: $WANTED (waiting for sync)"
-  elif [ "$WANTED" != "$CURRENT_VIDEO_PATH" ]; then
-    log "Switching to: $WANTED"
+  elif [ "$WANTED" != "$CURRENT_VIDEO_PATH" ] || [ "$(get_mtime "$WANTED")" != "$CURRENT_VIDEO_MTIME" ]; then
+    # The mtime half of this catches an SFTP overwrite of the currently-
+    # playing video: sync.sh downloads the new content to this exact same
+    # path (same VideoFile id — see mediaSlot.ts's in-place update) via an
+    # atomic `mv`, which VLC's already-open, --loop'd file handle has no way
+    # to notice on its own. Same blind spot CURRENT_STATIC_IMAGE_MTIME
+    # already covers for the onboarding/idle screens, extended here to real
+    # scheduled video now that SFTP overwrite made "same path, new content"
+    # a real case for it too.
+    if [ "$WANTED" != "$CURRENT_VIDEO_PATH" ]; then
+      log "Switching to: $WANTED"
+    else
+      log "Content updated for currently-playing video — reloading: $WANTED"
+    fi
     start_vlc "$WANTED" "" "$OVERLAY_WANT"
   elif ! kill -0 "$VLC_PID" 2>/dev/null; then
     # VLC died unexpectedly — restart it (and multicast alongside it)

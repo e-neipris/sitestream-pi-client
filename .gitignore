@@ -17,3 +17,8 @@ pi-portal/web-dist/
 # not something to check in; they'd also make the repo grow unboundedly
 # with every version ever built.
 Releases/
+
+# Captured golden SD-card images (Win32DiskImager output, for mass-provisioning
+# via cloning — see the Pi imaging workflow) — tens of GB each, nowhere near
+# something Git/GitHub can handle.
+DiskImage/
