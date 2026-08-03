@@ -358,13 +358,17 @@ MULTICAST_PORT=$(echo "$MANIFEST" | jq -r '.multicastPort // empty')
 # own SaaS traffic. Empty means "let VLC/the OS pick," same as before this
 # existed — see player.sh's start_multicast for where this is consumed.
 MULTICAST_INTERFACE=$(echo "$MANIFEST" | jq -r '.multicastInterface // empty')
+# No HDMI display ever attached — see player.sh's own comment on HEADLESS_MODE
+# for why this exists and exactly what it skips.
+HEADLESS_MODE=$(echo "$MANIFEST" | jq -r '.headlessMode // false')
 
-grep -vE '^(MULTICAST_ENABLED|MULTICAST_ADDRESS|MULTICAST_PORT|MULTICAST_INTERFACE)=' "$CONFIG" 2>/dev/null > "$CONFIG.tmp" || true
+grep -vE '^(MULTICAST_ENABLED|MULTICAST_ADDRESS|MULTICAST_PORT|MULTICAST_INTERFACE|HEADLESS_MODE)=' "$CONFIG" 2>/dev/null > "$CONFIG.tmp" || true
 {
   echo "MULTICAST_ENABLED=$MULTICAST_ENABLED"
   echo "MULTICAST_ADDRESS=$MULTICAST_ADDRESS"
   echo "MULTICAST_PORT=$MULTICAST_PORT"
   echo "MULTICAST_INTERFACE=$MULTICAST_INTERFACE"
+  echo "HEADLESS_MODE=$HEADLESS_MODE"
 } >> "$CONFIG.tmp"
 mv "$CONFIG.tmp" "$CONFIG"
 chmod 600 "$CONFIG"

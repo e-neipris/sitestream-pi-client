@@ -270,10 +270,25 @@ while true; do
     # No configured Wi-Fi profile at all — the original "never set up"
     # case, unrelated to rescue mode.
     rm -f "$STRUGGLING_SINCE_FILE"
-    if is_claimed; then
-      # Claimed with no Wi-Fi profile at all (e.g. Ethernet-only site, or
-      # the profile was deliberately removed) — nothing a Wi-Fi hotspot can
-      # fix, so leave it alone rather than broadcasting pointlessly.
+    # is_claimed() alone used to gate this — "claimed with no Wi-Fi profile"
+    # was assumed to always mean a deliberate Ethernet-only site, where a
+    # hotspot would be pointless. That's wrong: "claimed" only means
+    # DEVICE_TOKEN is present in config.env, which says nothing about
+    # whether this device can actually reach anything RIGHT NOW. Confirmed
+    # live as a real incident: a "forget Wi-Fi only" factory reset (which
+    # deliberately keeps the device claimed) can hit a brief window of
+    # connectivity right after — a momentary Ethernet link, a not-yet-torn-
+    # down stale association, anything — long enough for sync.sh's own
+    # zero-touch re-checkin to silently write a fresh DEVICE_TOKEN back into
+    # config.env. From that point on, is_claimed() reads true forever
+    # (surviving any number of reboots — it's just a file on disk), even
+    # after that connectivity is long gone, permanently suppressing the one
+    # hotspot mechanism that could otherwise rescue it. Requiring verified
+    # eth0 connectivity (not just "claimed") before suppressing the hotspot
+    # closes that gap — the legitimate Ethernet-only-site case this was
+    # written for still works exactly the same, since it always did have a
+    # real eth0 link in the first place.
+    if is_claimed && eth0_connected; then
       stop_hotspot
     else
       start_hotspot

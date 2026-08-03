@@ -190,6 +190,17 @@ stop_multicast() {
   fi
   MULTICAST_PID=""
   CURRENT_MULTICAST_TARGET=""
+  # Backstop, same reasoning as stop_vlc's own `pkill -f "vlc"` below —
+  # $MULTICAST_PID only ever tracks a process THIS instance of player.sh
+  # itself started. Confirmed live as a real incident, not theoretical: a
+  # multicast stream kept running with no trace of it in the SaaS or in
+  # config.env at all, because the ffmpeg process was orphaned by a PREVIOUS
+  # instance of player.sh that didn't exit through the graceful trap below
+  # (crash, OOM-kill, anything that skips it) — Restart=always brought
+  # player.sh back with a fresh, empty $MULTICAST_PID that had no way to
+  # ever know that old process existed. This catches it regardless of which
+  # instance started it.
+  pkill -f "ffmpeg.*udp://" 2>/dev/null || true
 }
 
 start_multicast() {
@@ -337,6 +348,30 @@ start_vlc() {
   # connectivity problems a different way.
   local show_disconnected="${3:-}"
   stop_vlc
+
+  # HEADLESS_MODE (from config.env, pushed via Device.headlessMode — see
+  # sync.sh) — this device has no HDMI display attached at all. VLC's DRM/KMS
+  # output can't acquire a connector with no cable/EDID detected (confirmed
+  # live: "Failed to find output <auto>", not in BENIGN_VOUT_LINES) without
+  # hdmi_force_hotplug, which isn't set anywhere in this fleet — every launch
+  # attempt fails, reads as a crashed VLC, and restarts in a loop forever.
+  # Skipping the actual launch here — while still updating the bookkeeping
+  # below and still calling start_multicast exactly as normal — means every
+  # other branch in the main loop that reacts to "did the wanted video
+  # change" keeps working unchanged; only the parts that assume a running
+  # VLC process is the expected steady state need their own guard (see
+  # HEADLESS_MODE checks further down in the main loop).
+  if [ "${HEADLESS_MODE:-}" = "true" ]; then
+    log "Headless mode — skipping HDMI output for: $video_path"
+    CURRENT_VIDEO_PATH="$video_path"
+    CURRENT_VIDEO_MTIME=$(get_mtime "$video_path")
+    CURRENT_OVERLAY_STATE="$show_disconnected"
+    if [ "$skip_multicast" != "no-multicast" ]; then
+      start_multicast "$video_path"
+    fi
+    return
+  fi
+
   log "Starting VLC: $video_path"
 
   MARQ_ARGS=()
@@ -456,6 +491,16 @@ get_current_video() {
 
 log "SiteStream player started."
 
+# Sweep for anything left multicasting by a previous, non-gracefully-exited
+# instance of this script — MULTICAST_PID above is freshly "" and has no way
+# to know about a process an earlier crashed/killed instance started. Cheap,
+# one-shot, and safe to run unconditionally: if nothing's there, this is a
+# no-op; if something is, it's stale by definition (this instance hasn't
+# decided to start multicasting yet at this point in the script).
+if pkill -f "ffmpeg.*udp://" 2>/dev/null; then
+  log "Cleaned up a multicast stream orphaned by a previous run."
+fi
+
 # Graceful shutdown on `systemctl stop`/`restart` — paired with KillMode=process
 # in the systemd unit (systemd then only signals this process directly, not
 # every process in its cgroup) so shutdown goes through our own stop_vlc
@@ -522,7 +567,8 @@ while true; do
     fi
     if [ -f "$SCREEN_IMAGE" ]; then
       SCREEN_MTIME=$(get_mtime "$SCREEN_IMAGE")
-      if [ "$CURRENT_VIDEO_PATH" != "$SCREEN_IMAGE" ] || [ "$SCREEN_MTIME" != "$CURRENT_STATIC_IMAGE_MTIME" ] || ! kill -0 "$VLC_PID" 2>/dev/null; then
+      if [ "$CURRENT_VIDEO_PATH" != "$SCREEN_IMAGE" ] || [ "$SCREEN_MTIME" != "$CURRENT_STATIC_IMAGE_MTIME" ] \
+        || { [ "${HEADLESS_MODE:-}" != "true" ] && ! kill -0 "$VLC_PID" 2>/dev/null; }; then
         log "$SCREEN_LOG_MSG"
         start_vlc "$SCREEN_IMAGE" no-multicast
         CURRENT_STATIC_IMAGE_MTIME="$SCREEN_MTIME"
@@ -578,7 +624,8 @@ while true; do
     fi
     if [ -f "$IDLE_IMAGE" ]; then
       IDLE_MTIME=$(get_mtime "$IDLE_IMAGE")
-      if [ "$CURRENT_VIDEO_PATH" != "$IDLE_IMAGE" ] || [ "$IDLE_MTIME" != "$CURRENT_STATIC_IMAGE_MTIME" ] || ! kill -0 "$VLC_PID" 2>/dev/null; then
+      if [ "$CURRENT_VIDEO_PATH" != "$IDLE_IMAGE" ] || [ "$IDLE_MTIME" != "$CURRENT_STATIC_IMAGE_MTIME" ] \
+        || { [ "${HEADLESS_MODE:-}" != "true" ] && ! kill -0 "$VLC_PID" 2>/dev/null; }; then
         log "$IDLE_LOG_MSG"
         start_vlc "$IDLE_IMAGE" no-multicast
         CURRENT_STATIC_IMAGE_MTIME="$IDLE_MTIME"
@@ -609,18 +656,24 @@ while true; do
       log "Content updated for currently-playing video — reloading: $WANTED"
     fi
     start_vlc "$WANTED" "" "$OVERLAY_WANT"
-  elif ! kill -0 "$VLC_PID" 2>/dev/null; then
-    # VLC died unexpectedly — restart it (and multicast alongside it)
+  elif [ "${HEADLESS_MODE:-}" != "true" ] && ! kill -0 "$VLC_PID" 2>/dev/null; then
+    # VLC died unexpectedly — restart it (and multicast alongside it).
+    # Excluded in headless mode: VLC_PID is deliberately never set there
+    # (start_vlc skips the actual launch — see its own comment), so this
+    # would otherwise read as "dead" and fire every single tick forever.
     VLC_RESTART_COUNT=$((VLC_RESTART_COUNT + 1))
     log "VLC not running, restarting: $WANTED"
     signal_urgent_health
     start_vlc "$WANTED" "" "$OVERLAY_WANT"
-  elif [ "$OVERLAY_WANT" != "$CURRENT_OVERLAY_STATE" ]; then
+  elif [ "${HEADLESS_MODE:-}" != "true" ] && [ "$OVERLAY_WANT" != "$CURRENT_OVERLAY_STATE" ]; then
     # Same video, but connectivity state flipped since VLC was last started —
     # the marq flag is startup-only (no live control channel for it — see
     # is_disconnected's comment), so this is a deliberate, infrequent
     # (minutes-scale) restart, same tradeoff already accepted for a
-    # multicast-config change below.
+    # multicast-config change below. Excluded in headless mode: the overlay
+    # is purely visual (nobody's looking at HDMI), and without this exclusion
+    # every connectivity flip would trigger a pointless real multicast
+    # restart — a small but real viewer-visible glitch for zero benefit.
     if [ "$OVERLAY_WANT" = "disconnected" ]; then
       log "Connectivity lost — adding on-screen indicator."
     else
@@ -651,6 +704,13 @@ while true; do
   elif [ -n "$MULTICAST_PID" ] && ! kill -0 "$MULTICAST_PID" 2>/dev/null; then
     log "Multicast output died, restarting: $WANTED"
     start_multicast "$WANTED"
+  elif [ "${HEADLESS_MODE:-}" = "true" ]; then
+    # Steady state, headless — there's no VLC process and no HDMI display to
+    # watchdog at all here (the checks below poll VLC's own HTTP interface,
+    # which nothing is listening on). Multicast's own health is already
+    # covered by the "process died, restart" branch above, independent of
+    # this. Deliberately a no-op, not an error.
+    :
   else
     # Steady state — same video, VLC process alive, multicast unchanged. A
     # frozen decoder or dead X connection still passes kill -0, so cross-check
