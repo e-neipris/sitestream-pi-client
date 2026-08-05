@@ -204,6 +204,11 @@ export interface MulticastConfig {
   address: string | null
   port: number | null
   interface: string | null
+  // Null = player.sh's own fleet-wide default (6000 kbps) applies — see its
+  // start_multicast. Kept optional here rather than forced to a concrete
+  // number so a standalone device's config.env stays consistent with a
+  // cloud-claimed one that's never had this explicitly set either.
+  maxBitrateKbps: number | null
 }
 
 // Same MULTICAST_* keys, same config.env, as sync.sh's cloud-driven path
@@ -219,6 +224,7 @@ function getMulticastConfig(): MulticastConfig {
     address: cfg.MULTICAST_ADDRESS || null,
     port: cfg.MULTICAST_PORT ? Number(cfg.MULTICAST_PORT) : null,
     interface: cfg.MULTICAST_INTERFACE || null,
+    maxBitrateKbps: cfg.MULTICAST_MAX_BITRATE_KBPS ? Number(cfg.MULTICAST_MAX_BITRATE_KBPS) : null,
   }
 }
 
@@ -228,7 +234,7 @@ function getMulticastConfig(): MulticastConfig {
 // sync.sh's own rewrite of these same four keys.
 function writeMulticastConfig(config: MulticastConfig): void {
   const existingLines = fs.existsSync(CONFIG_FILE) ? fs.readFileSync(CONFIG_FILE, 'utf8').split('\n') : []
-  const kept = existingLines.filter((line) => !/^(MULTICAST_ENABLED|MULTICAST_ADDRESS|MULTICAST_PORT|MULTICAST_INTERFACE)=/.test(line))
+  const kept = existingLines.filter((line) => !/^(MULTICAST_ENABLED|MULTICAST_ADDRESS|MULTICAST_PORT|MULTICAST_INTERFACE|MULTICAST_MAX_BITRATE_KBPS)=/.test(line))
   while (kept.length && kept[kept.length - 1] === '') kept.pop()
 
   const next = [
@@ -237,6 +243,7 @@ function writeMulticastConfig(config: MulticastConfig): void {
     `MULTICAST_ADDRESS=${config.address ?? ''}`,
     `MULTICAST_PORT=${config.port ?? ''}`,
     `MULTICAST_INTERFACE=${config.interface ?? ''}`,
+    `MULTICAST_MAX_BITRATE_KBPS=${config.maxBitrateKbps ?? ''}`,
   ].join('\n') + '\n'
 
   fs.writeFileSync(CONFIG_FILE, next, { mode: 0o600 })
@@ -643,8 +650,14 @@ export default async function systemRoutes(app: FastifyInstance) {
     const body = z.object({
       enabled: z.boolean(),
       address: z.string().min(1).optional(),
-      port: z.number().int().min(1).max(65535).optional(),
+      // >= 1024: the IPTV hardware this feeds requires a port "within the
+      // standard reserved range not less than 1024" per its own ingest spec.
+      port: z.number().int().min(1024).max(65535).optional(),
       interface: z.string().optional(),
+      // Null/omitted = player.sh's own fleet-wide default. 500 floor is a
+      // sanity bound; 25000 ceiling matches the receiving hardware's
+      // absolute combined limit even for a single stream.
+      maxBitrateKbps: z.number().int().min(500).max(25000).optional().nullable(),
     }).refine((v) => !v.enabled || (v.address && v.port), {
       message: 'Address and port are required when multicast is enabled',
     }).safeParse(request.body)
@@ -656,6 +669,7 @@ export default async function systemRoutes(app: FastifyInstance) {
         address: body.data.address ?? null,
         port: body.data.port ?? null,
         interface: body.data.interface ?? null,
+        maxBitrateKbps: body.data.maxBitrateKbps ?? null,
       })
       return { ok: true }
     } catch (err) {

@@ -38,12 +38,57 @@ CURRENT_STATIC_IMAGE_MTIME=""
 # nothing here noticed.
 CURRENT_VIDEO_MTIME=""
 CURRENT_MULTICAST_TARGET=""
+# Fixed local port for the persistent multicast VLC instance's RC (remote
+# control) interface — see start_multicast's own comment for why this
+# process now stays alive across a video change instead of being killed and
+# relaunched. Loopback-only (bound to 127.0.0.1 explicitly below), same
+# trust boundary as the HDMI VLC's existing --http-host 127.0.0.1 interface;
+# RC has no password option (confirmed via `vlc -H --advanced` — HTTP does,
+# RC doesn't), so this relies on that binding alone.
+MULTICAST_RC_PORT=9090
+# Which playlist item id, inside the persistent multicast VLC instance's own
+# internal playlist, is the one currently playing — needed to delete the OLD
+# item after a live swap (see swap_multicast_video). Reset alongside
+# MULTICAST_PID whenever the process itself restarts, since a fresh process
+# starts its own id numbering over from scratch.
+CURRENT_MULTICAST_PLID=""
+# The video path the persistent multicast VLC instance is actually playing
+# right now — distinct from CURRENT_MULTICAST_TARGET (config: enabled/
+# address/port/interface only, see start_multicast) so the two can be
+# compared independently: a config change needs a full process restart (the
+# --sout target is baked in at launch), but a video-only change can use the
+# much gentler live swap instead.
+CURRENT_MULTICAST_VIDEO_PATH=""
+# The enabled:address:port:interface signature the CURRENTLY RUNNING
+# multicast process was actually launched with — compared against a fresh
+# computation of the same fields each call to decide whether the process can
+# stay alive (video-only change, or nothing changed) or needs a full restart
+# (any of those four actually changed). Deliberately separate from
+# CURRENT_MULTICAST_TARGET above, which the main loop uses for a different
+# purpose (whether to call start_multicast at all) and includes the video
+# path — this one deliberately doesn't, since a video-only change is exactly
+# the case that should NOT force a restart.
+MULTICAST_PROCESS_CONFIG=""
 # What VLC was actually last started with — "disconnected" or "" — so a
 # transition can be detected and acted on (see is_disconnected below), same
 # tracked-vs-desired-state pattern as CURRENT_MULTICAST_TARGET above.
 CURRENT_OVERLAY_STATE=""
+# Same tracked-vs-desired-state pattern as CURRENT_OVERLAY_STATE above, for
+# the same reason: HEADLESS_MODE flipping while VLC is already running is
+# otherwise invisible to every branch below, since none of them treat the
+# flag itself changing as a reason to re-evaluate — they only react to the
+# wanted *video* changing, VLC dying, etc. Without this, turning Headless on
+# for a device that's actively playing never actually stops the HDMI output
+# already running; it only prevents a *future* start. See the main loop's
+# own HEADLESS_MODE-changed check.
+CURRENT_HEADLESS_STATE=""
 VLC_PID=""
 MULTICAST_PID=""
+# PID of the backgrounded `sleep 30 & wait $!` (see the loop's own comment),
+# tracked so the shutdown trap can reap it directly instead of leaving it to
+# outlive the service and log a "left-over process... Ignoring" warning on
+# the next start.
+LOOP_SLEEP_PID=""
 STATUS_FILE="$SITESTREAM_DIR/status.json"
 # Counts only *unexpected* restarts (death/freeze recovery) — not normal
 # schedule-driven video switches. A rising count signals real instability;
@@ -190,92 +235,300 @@ stop_multicast() {
   fi
   MULTICAST_PID=""
   CURRENT_MULTICAST_TARGET=""
+  MULTICAST_PROCESS_CONFIG=""
+  CURRENT_MULTICAST_VIDEO_PATH=""
+  CURRENT_MULTICAST_PLID=""
   # Backstop, same reasoning as stop_vlc's own `pkill -f "vlc"` below —
   # $MULTICAST_PID only ever tracks a process THIS instance of player.sh
   # itself started. Confirmed live as a real incident, not theoretical: a
   # multicast stream kept running with no trace of it in the SaaS or in
-  # config.env at all, because the ffmpeg process was orphaned by a PREVIOUS
-  # instance of player.sh that didn't exit through the graceful trap below
-  # (crash, OOM-kill, anything that skips it) — Restart=always brought
-  # player.sh back with a fresh, empty $MULTICAST_PID that had no way to
-  # ever know that old process existed. This catches it regardless of which
-  # instance started it.
-  pkill -f "ffmpeg.*udp://" 2>/dev/null || true
+  # config.env at all, because the broadcast process was orphaned by a
+  # PREVIOUS instance of player.sh that didn't exit through the graceful
+  # trap below (crash, OOM-kill, anything that skips it) — Restart=always
+  # brought player.sh back with a fresh, empty $MULTICAST_PID that had no
+  # way to ever know that old process existed. This catches it regardless of
+  # which instance started it.
+  #
+  # Matches on "--sout" specifically, not just "vlc" — cvlc is a wrapper
+  # script that execs `vlc -I dummy "$@"` (confirmed live: ps shows the
+  # actual running process as plain `vlc`, never `cvlc`), so a broad "vlc"
+  # pattern would ALSO match the completely separate HDMI-display VLC
+  # process stop_vlc below manages, and kill it by accident every time this
+  # runs. --sout only ever appears on the multicast broadcast invocation.
+  pkill -f "vlc.*--sout" 2>/dev/null || true
+}
+
+# Sends $1 as a command to the persistent multicast VLC's RC interface and
+# prints back whatever it responds with. Uses bash's own /dev/tcp facility
+# rather than depending on nc/netcat being installed fleet-wide — confirmed
+# live this works fine against VLC's RC protocol. Returns non-zero (with no
+# output) if the connection itself fails, e.g. the process died or the RC
+# interface isn't up yet — callers treat that as "swap failed, fall back to
+# a full restart" rather than trusting a response that never arrived.
+send_multicast_rc() {
+  local cmd="$1"
+  local rc_fd
+  local err_tmp="/tmp/.rc_connect_err.$$"
+  exec {rc_fd}<>"/dev/tcp/127.0.0.1/$MULTICAST_RC_PORT" 2>"$err_tmp"
+  local connect_rc=$?
+  local connect_err
+  connect_err=$(cat "$err_tmp" 2>/dev/null)
+  rm -f "$err_tmp"
+  # >&2, not stdout: this function's stdout IS its return value (the RC
+  # response text), captured via $(...) at every call site. A plain `log`
+  # here would silently splice this debug text into that captured value —
+  # confirmed live this is exactly what broke the `= "ok"` check below.
+  log "DEBUG rc: cmd=[$cmd] connect_rc=$connect_rc connect_err=[$connect_err] fd=$rc_fd openfds=$(ls /proc/self/fd 2>/dev/null | wc -l)" >&2
+  if [ "$connect_rc" -ne 0 ]; then return 1; fi
+  # VLC writes its own banner ("VLC media player ... Command Line Interface
+  # initialized...") the instant a new RC connection opens, unprompted and
+  # before it has even seen our command. Confirmed live: without draining
+  # this first, that banner is what a subsequent read actually returns —
+  # the real command response either never gets read at all (still sitting
+  # unread in the socket when we give up) or arrives concatenated after it,
+  # and either way the "new input:" match below silently fails every time.
+  local banner
+  banner=$(timeout 0.5 cat <&"$rc_fd")
+  log "DEBUG rc: cmd=[$cmd] drained banner=[$banner]" >&2
+  printf '%s\n' "$cmd" >&"$rc_fd"
+  local write_rc=$?
+  local out
+  out=$(timeout 2 cat <&"$rc_fd")
+  local read_rc=$?
+  log "DEBUG rc: cmd=[$cmd] write_rc=$write_rc read_rc=$read_rc out=[$out]" >&2
+  exec {rc_fd}<&-
+  exec {rc_fd}>&-
+  printf '%s' "$out"
+}
+
+# The actual mechanism this whole persistent-process design exists for:
+# switch the currently-scheduled video WITHOUT tearing down the UDP stream
+# to SMARTBOX, unlike the old kill-and-relaunch-ffmpeg/cvlc approach every
+# earlier release used. Confirmed live: SMARTBOX froze on the last frame and
+# needed a manual reset every time a schedule change killed and restarted
+# the broadcast process — a receiver-side re-acquisition problem that a
+# fresh process/fresh UDP source port makes worse, not better.
+#
+# --sout-keep (already on the persistent process — see start_multicast) is
+# VLC's own documented mechanism for exactly this: "keep an unique stream
+# output instance across multiple playlist items." The RC `add` command
+# queues a new item and starts playing it immediately without stopping the
+# current one first — confirmed live via tcpdump/tshark this is dramatically
+# gentler than `clear` (which stops the current item outright before adding
+# the new one): `add` measured a ~44ms max gap at the transition, `clear`
+# measured ~460ms for the exact same swap. The playlist is then explicitly
+# pruned back down to one item (deleting the old one) so --loop only ever
+# has the new video to cycle — confirmed live this is what actually happens
+# if the old item is left in place: --loop eventually wraps back around to
+# it and undoes the whole swap.
+#
+# Echoes "ok" on confirmed success, nothing on failure — the caller falls
+# back to a full restart on anything other than "ok", since a half-completed
+# swap (new item added but old one never confirmed/removed) is worse than
+# just paying the restart cost this one time.
+swap_multicast_video() {
+  local new_path="$1"
+  local new_filename
+  new_filename=$(basename "$new_path")
+
+  local add_response
+  add_response=$(send_multicast_rc "add file://$new_path")
+  local add_rc=$?
+  # >&2 — same reason as send_multicast_rc's DEBUG lines: this function's
+  # stdout is its "ok"/empty return value, captured via $(...) by the caller.
+  log "DEBUG swap: add_rc=$add_rc add_response=[$add_response]" >&2
+  if [ "$add_rc" -ne 0 ]; then return 1; fi
+
+  # Deliberately NOT gating on "new input:" appearing in add_response above.
+  # Confirmed live: that text is an async status notification, not a
+  # synchronous reply to `add` — VLC can (and does) still be printing the RC
+  # banner or simply hasn't gotten to it yet by the time our read window
+  # closes, even seconds later. Gating on it made this fail almost every
+  # time regardless of whether the add itself actually worked. The playlist
+  # query below is authoritative either way (it reflects queue state, not a
+  # timing-dependent event), so confirming success there is both sufficient
+  # and far more reliable. A short retry loop covers the (much smaller) lag
+  # between `add` returning and the item actually showing up in `playlist`.
+  local playlist_response new_plid attempt
+  for attempt in 1 2 3 4 5; do
+    playlist_response=$(send_multicast_rc "playlist")
+    local playlist_rc=$?
+    log "DEBUG swap: attempt=$attempt playlist_rc=$playlist_rc playlist_response=[$playlist_response]" >&2
+    if [ "$playlist_rc" -eq 0 ]; then
+      new_plid=$(printf '%s' "$playlist_response" | grep -F "$new_filename" | sed -nE 's/^\| *\*?([0-9]+).*/\1/p' | head -1)
+      [ -n "$new_plid" ] && break
+    fi
+    sleep 0.3
+  done
+  if [ -z "$new_plid" ]; then
+    return 1
+  fi
+
+  # Old item may not exist yet (very first swap after a fresh process start
+  # — see start_multicast, where CURRENT_MULTICAST_PLID gets discovered the
+  # same way right after launch) — nothing to delete in that case.
+  if [ -n "$CURRENT_MULTICAST_PLID" ]; then
+    send_multicast_rc "delete $CURRENT_MULTICAST_PLID" >/dev/null || true
+  fi
+
+  CURRENT_MULTICAST_PLID="$new_plid"
+  echo ok
 }
 
 start_multicast() {
-  local video_path="$1"
-  stop_multicast
-  # Record the target state immediately, even when it resolves to "disabled" —
-  # otherwise stop_multicast's reset to "" never gets superseded when the
-  # guard below returns early, and the main loop's config-changed check keeps
+  # The MPEG-2 Program Stream variant sync.sh downloaded for the currently-
+  # scheduled video (schedule.json's multicastLocalPath — see get_current_video)
+  # — NOT the H.264 file VLC plays over HDMI. Empty whenever the SaaS side
+  # hasn't finished transcoding it yet (or the file simply doesn't need one —
+  # see services/multicastTranscode.ts), which is the common case for most
+  # of a device's uptime right after multicast gets newly enabled.
+  local multicast_video_path="$1"
+  # Record the target state immediately, even when it resolves to "disabled"
+  # or "not ready yet" — otherwise the main loop's config-changed check keeps
   # re-triggering this function every tick forever, starving out the `else`
-  # branch (the VLC stall/freeze watchdog) below it.
-  CURRENT_MULTICAST_TARGET="$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT:$MULTICAST_INTERFACE"
+  # branch (the VLC stall/freeze watchdog) below it. Must match the main
+  # loop's own copy of this exact string field-for-field, or the two can
+  # never agree and this restarts on every single tick forever — see the
+  # MULTICAST_INTERFACE comment lower down in this file for the exact bug
+  # that happens when they drift out of sync. This is purely the "should the
+  # main loop even call start_multicast" signal — separate from
+  # MULTICAST_PROCESS_CONFIG below, which is what THIS function uses to
+  # decide whether the already-running process (if any) can keep going.
+  CURRENT_MULTICAST_TARGET="$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT:$MULTICAST_INTERFACE:$multicast_video_path"
   if [ "$MULTICAST_ENABLED" != "true" ] || [ -z "$MULTICAST_ADDRESS" ] || [ -z "$MULTICAST_PORT" ]; then
+    stop_multicast
     return
   fi
-  if ! command -v ffmpeg >/dev/null 2>&1; then
-    log "ERROR: ffmpeg not installed — cannot start multicast output. Re-run install.sh (or apply a firmware update) to pick it up."
+  if [ -z "$multicast_video_path" ]; then
+    log "Multicast enabled but no MPEG-2 variant is ready yet for the current video — waiting for the SaaS transcode to finish (see the Media page)."
+    return
+  fi
+  if [ ! -f "$multicast_video_path" ]; then
+    log "Multicast enabled and the SaaS says a variant is ready, but it's not on disk yet — waiting for sync.sh to finish downloading it."
+    return
+  fi
+  if ! command -v cvlc >/dev/null 2>&1; then
+    log "ERROR: cvlc not installed — cannot start multicast output. Re-run install.sh (or apply a firmware update) to pick it up."
     return
   fi
 
-  # localaddr= pins which NIC actually transmits the multicast packets,
-  # overriding whatever the kernel's own routing table would otherwise pick
-  # — needed the moment this device also uses a different interface (e.g.
-  # wlan0) for its own SaaS traffic, so multicast doesn't silently try to go
-  # out that one instead of the wired ingestion port. ffmpeg's udp muxer
-  # takes a bind IP, not an interface name (unlike VLC's old --miface) — so
-  # resolve MULTICAST_INTERFACE to its current IPv4 address here. Empty/unset
-  # (the common case), or a lookup failure, just omits the param — same
-  # "let the OS decide" behavior as before this existed.
-  LOCALADDR_QS=""
-  if [ -n "$MULTICAST_INTERFACE" ]; then
-    IFACE_IP=$(ip -4 -o addr show "$MULTICAST_INTERFACE" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-    if [ -n "$IFACE_IP" ]; then
-      LOCALADDR_QS="&localaddr=$IFACE_IP"
-    else
-      log "WARN: could not resolve an IPv4 address for multicast interface '$MULTICAST_INTERFACE' — letting the OS pick the outgoing interface instead."
+  local config_signature="$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT:$MULTICAST_INTERFACE"
+  local process_alive="false"
+  [ -n "$MULTICAST_PID" ] && kill -0 "$MULTICAST_PID" 2>/dev/null && process_alive="true"
+
+  # Steady state: same process, same video already playing — nothing to do.
+  # The main loop only calls start_multicast when ITS OWN copy of the target
+  # string changed, but that string includes fields (MULTICAST_ENABLED
+  # toggling back to the same value some other way, headless-mode-driven
+  # calls, etc.) that don't always mean the video itself actually changed.
+  if [ "$process_alive" = "true" ] && [ "$config_signature" = "$MULTICAST_PROCESS_CONFIG" ] \
+    && [ "$multicast_video_path" = "$CURRENT_MULTICAST_VIDEO_PATH" ]; then
+    return
+  fi
+
+  # Video-only change against an already-running, correctly-configured
+  # process — the gentle path this whole redesign exists for. Address/port/
+  # interface changes still fall through to the full restart below: those
+  # are baked into --sout at launch and can't be changed on a live process.
+  if [ "$process_alive" = "true" ] && [ "$config_signature" = "$MULTICAST_PROCESS_CONFIG" ]; then
+    log "Switching multicast output to: $multicast_video_path (live, no stream interruption)"
+    if [ "$(swap_multicast_video "$multicast_video_path")" = "ok" ]; then
+      CURRENT_MULTICAST_VIDEO_PATH="$multicast_video_path"
+      return
     fi
+    log "WARN: live multicast swap failed — falling back to a full restart."
+    # Falls through to the full restart below.
   fi
 
-  log "Starting multicast output: udp://$MULTICAST_ADDRESS:$MULTICAST_PORT${MULTICAST_INTERFACE:+ via $MULTICAST_INTERFACE}"
-  # -c copy: remux the existing H.264 MP4 into MPEG-TS rather than
-  # re-encoding it, which is what sync.sh downloads today. Revisit this once
-  # you have the tuner manufacturer's exact ingest spec.
+  # Full restart: first launch, config changed, process died, or the live
+  # swap above failed and needs a clean slate to retry from.
+  stop_multicast
+
+  # --miface takes an interface NAME directly (unlike ffmpeg's udp muxer,
+  # which needed an IP resolved via `ip addr` — see the git history on this
+  # function for that version). Confirmed live this is a real, global VLC
+  # option (`vlc -H --advanced` lists it under core network options), NOT a
+  # sub-option of the #std{access=udp{...}} chain the way it's commonly
+  # written online — `udp{miface=eth0}` was tried first and rejected
+  # outright ("option miface is unknown"). Omitted entirely when
+  # MULTICAST_INTERFACE is unset, same "let the OS decide" behavior as
+  # before.
+  MIFACE_ARGS=()
+  if [ -n "$MULTICAST_INTERFACE" ]; then
+    MIFACE_ARGS=(--miface "$MULTICAST_INTERFACE")
+  fi
+
+  log "Starting multicast output: udp://$MULTICAST_ADDRESS:$MULTICAST_PORT${MULTICAST_INTERFACE:+ via $MULTICAST_INTERFACE} ($multicast_video_path)"
+  # The SMARTBOX-class hardware these feeds only decodes MPEG-2, not the
+  # H.264 everything else in the fleet uses — reported "Input Present: No
+  # PSI data" (a misleading error) against every H.264 approach tried here.
+  # See services/multicastTranscode.ts on the SaaS side for the actual
+  # transcode command — this device just downloads the finished MPEG-2 file
+  # (sync.sh) and loops it out; no re-encode happens here, this is a remux.
   #
-  # Switched from VLC to ffmpeg here (VLC still drives the HDMI display
-  # process above, untouched) after confirming live, on real hardware, that
-  # VLC's own loop mechanism — --loop AND --input-repeat both — corrupts the
-  # TS mux's PCR/DTS at every wraparound ("putting two PCRs at once", "packet
-  # with too strange dts" firing exactly once per video-length interval,
-  # reproduced on two different test files). A receiving player got the UDP
-  # packets fine but could never demux a valid container out of them. ffmpeg
-  # is the standard, purpose-built tool for exactly this "loop a file forever
-  # to a live stream" case and regenerates continuous timestamps across the
-  # loop boundary instead of restarting the clock.
+  # cvlc, not ffmpeg -c copy -muxrate (tried first, in earlier releases) —
+  # confirmed live via tcpdump/tshark on the real device that ffmpeg's
+  # output, even with -muxrate padding, stayed bursty around every keyframe
+  # (200+ ms gaps against a <40ms spec, tuning the rate higher didn't help)
+  # and that was enough to make SMARTBOX give up after ~20s. cvlc's
+  # steady-state output measured completely clean by comparison — 0 gaps
+  # over 40ms in multiple captures, max ~25ms — once past a brief (~1-2s)
+  # burst right at startup while sout-keep does its initial buffer fill;
+  # that startup burst appears to be a one-time thing, not a recurring
+  # per-loop artifact (confirmed by capturing across an actual loop
+  # wraparound with clean, monotonically increasing PCR the whole way
+  # through — see the note on --loop below).
   #
-  # -re: read the input at its native frame rate. Without this, ffmpeg (with
-  # no decode step to naturally pace it, same reason VLC needed forcing here
-  # too) reads and remuxes the file as fast as disk I/O allows — a burst of
-  # the whole video at once instead of paced real-time delivery.
-  # -stream_loop -1: loop forever, ffmpeg's own native mechanism (built for
-  # this, unlike VLC's) — no --sout-keep-style workaround needed.
-  # pkt_size=1316: 7 TS packets (7*188B) per UDP datagram — the standard,
-  # widely-used size for MPEG-TS-over-UDP that keeps payloads under typical
-  # MTU and aligned to TS packet boundaries; matters for compatibility with
-  # real IPTV tuner hardware, the eventual actual consumer of this stream.
-  # ttl=32: multicast packets default to TTL 1 (one hop) on most stacks,
+  # --loop: this is the same flag an EARLIER attempt at cvlc broadcasting
+  # was abandoned over — confirmed live at the time that VLC's --loop
+  # corrupted the TS mux's PCR/DTS at every wraparound for H.264 content
+  # ("putting two PCRs at once", "packet with too strange dts"). Retested
+  # specifically for that regression with this MPEG-2 content by capturing
+  # PCR values across a real loop boundary (the source is ~272s) and
+  # checking for any backward jump — none found across 375 samples spanning
+  # the wraparound. Whatever caused the original bug does not reproduce
+  # here; if it ever does, the field symptom would be a receiver glitch
+  # roughly once per video-length interval, not a constant problem.
+  # --sout-keep: keeps the stream-output chain alive/warm across BOTH the
+  # --loop restart AND a live video swap (see swap_multicast_video above) —
+  # the entire reason a video change no longer needs to kill this process.
+  # --ttl 32: multicast packets default to TTL 1 (one hop) on most stacks,
   # which silently dies at the first router/VLAN boundary between this
   # device and whatever's watching — set explicitly rather than relying on
   # a default that only works when sender and receiver share one L2 segment.
-  ffmpeg -nostdin -hide_banner -loglevel warning \
-    -re -stream_loop -1 -i "$video_path" \
-    -c copy \
-    -f mpegts \
-    "udp://$MULTICAST_ADDRESS:$MULTICAST_PORT?ttl=32&pkt_size=1316${LOCALADDR_QS}" \
+  # --extraintf rc --rc-host 127.0.0.1:$MULTICAST_RC_PORT: the control
+  # channel swap_multicast_video drives. Loopback-only, no password option
+  # exists for RC (see MULTICAST_RC_PORT's own comment above).
+  cvlc -I dummy \
+    "$multicast_video_path" \
+    --sout="#std{access=udp,mux=ts,dst=$MULTICAST_ADDRESS:$MULTICAST_PORT}" \
+    --sout-keep \
+    --loop \
+    --ttl 32 \
+    --extraintf rc \
+    --rc-host "127.0.0.1:$MULTICAST_RC_PORT" \
+    "${MIFACE_ARGS[@]}" \
     >>"$SITESTREAM_DIR/logs/vlc-multicast.log" 2>&1 &
   MULTICAST_PID=$!
+  MULTICAST_PROCESS_CONFIG="$config_signature"
+  CURRENT_MULTICAST_VIDEO_PATH="$multicast_video_path"
+
+  # Discover the id VLC assigned the initial command-line video, the same
+  # way swap_multicast_video finds a freshly-added one — needed so the
+  # FIRST live swap later has a valid old-id to delete. A few short retries
+  # rather than one fixed sleep: the RC interface needs a brief moment to
+  # come up after the process forks, and the exact delay isn't worth
+  # over-tuning since this only runs once per process lifetime.
+  local new_filename discovered_plid attempt
+  new_filename=$(basename "$multicast_video_path")
+  for attempt in 1 2 3 4 5; do
+    sleep 1
+    discovered_plid=$(send_multicast_rc "playlist" | grep -F "$new_filename" | sed -nE 's/^\| *\*?([0-9]+).*/\1/p' | head -1)
+    if [ -n "$discovered_plid" ]; then
+      CURRENT_MULTICAST_PLID="$discovered_plid"
+      break
+    fi
+  done
 }
 
 stop_vlc() {
@@ -287,8 +540,25 @@ stop_vlc() {
   CURRENT_VIDEO_PATH=""
   CURRENT_STATIC_IMAGE_MTIME=""
   CURRENT_OVERLAY_STATE=""
-  stop_multicast
-  pkill -f "vlc" 2>/dev/null || true
+  # Deliberately does NOT touch multicast (no stop_multicast call here) —
+  # start_vlc calls this unconditionally on every single call, including a
+  # plain schedule-driven video change, which is exactly the case the
+  # persistent-multicast-process redesign exists to NOT interrupt (see
+  # start_multicast/swap_multicast_video). The two processes' lifecycles are
+  # deliberately independent now: callers that actually want multicast
+  # stopped too (nothing scheduled at all, real shutdown) call
+  # stop_multicast explicitly alongside this, not through it.
+  #
+  # Matches on "--vout drm_vout" specifically, not just "vlc" — the
+  # multicast process is also plain `vlc` under the hood now (cvlc is a
+  # wrapper — see stop_multicast's own comment), and stop_vlc runs on every
+  # single schedule-driven video change. A broad "vlc" pattern here would
+  # kill the persistent multicast process on every one of those calls,
+  # silently undoing the entire point of the live-swap redesign (see
+  # start_multicast/swap_multicast_video) via this backstop alone, even
+  # after removing the direct stop_multicast call above. --vout drm_vout
+  # only ever appears on the HDMI-display invocation.
+  pkill -f "vlc.*--vout drm_vout" 2>/dev/null || true
 }
 
 # True when this is a cloud-claimed device that hasn't actually reached the
@@ -347,7 +617,22 @@ start_vlc() {
   # onboarding/idle/rescue static screens, which already communicate
   # connectivity problems a different way.
   local show_disconnected="${3:-}"
+  # The MPEG-2 variant of $video_path (schedule.json's multicastLocalPath),
+  # if the current schedule entry has one — see get_current_video and
+  # start_multicast's own comment for why this is a separate file rather
+  # than a flag on $video_path.
+  local multicast_video_path="${4:-}"
   stop_vlc
+  # Explicit, not a side effect of stop_vlc (which deliberately no longer
+  # touches multicast at all — see its own comment) — a static onboarding/
+  # idle/rescue screen means there's no real video to broadcast, so any
+  # multicast stream already running from before this transition needs to
+  # actually stop here. Real scheduled video (skip_multicast unset) never
+  # takes this path — start_multicast below decides on its own whether that
+  # case needs a restart, a live swap, or nothing at all.
+  if [ "$skip_multicast" = "no-multicast" ]; then
+    stop_multicast
+  fi
 
   # HEADLESS_MODE (from config.env, pushed via Device.headlessMode — see
   # sync.sh) — this device has no HDMI display attached at all. VLC's DRM/KMS
@@ -366,8 +651,9 @@ start_vlc() {
     CURRENT_VIDEO_PATH="$video_path"
     CURRENT_VIDEO_MTIME=$(get_mtime "$video_path")
     CURRENT_OVERLAY_STATE="$show_disconnected"
+    CURRENT_HEADLESS_STATE="true"
     if [ "$skip_multicast" != "no-multicast" ]; then
-      start_multicast "$video_path"
+      start_multicast "$multicast_video_path"
     fi
     return
   fi
@@ -452,16 +738,22 @@ start_vlc() {
   CURRENT_VIDEO_PATH="$video_path"
   CURRENT_VIDEO_MTIME=$(get_mtime "$video_path")
   CURRENT_OVERLAY_STATE="$show_disconnected"
+  CURRENT_HEADLESS_STATE="${HEADLESS_MODE:-}"
   LAST_VLC_TIME=""
   LAST_DISPLAYED_PICTURES="0"
   STALL_COUNT=0
 
   if [ "$skip_multicast" != "no-multicast" ]; then
-    start_multicast "$video_path"
+    start_multicast "$multicast_video_path"
   fi
 }
 
-# Returns the local file path that should be playing right now, or empty string
+# Prints two lines for the schedule entry that should be playing right now:
+# localPath (H.264, VLC/HDMI), then multicastLocalPath (MPEG-2, may be empty —
+# see get_current_video's own comment on the two paths' relationship). Both
+# read from a single jq call/single selected entry rather than two separate
+# lookups, so a schedule-boundary tick can never see the two disagree about
+# which entry is "current."
 get_current_video() {
   [ -f "$SCHEDULE_FILE" ] || return
 
@@ -485,7 +777,7 @@ get_current_video() {
     | sort_by(.priority)
     | reverse
     | first
-    | .localPath // empty
+    | (.localPath // "") + "\n" + (.multicastLocalPath // "")
   ' "$SCHEDULE_FILE" 2>/dev/null
 }
 
@@ -497,19 +789,21 @@ log "SiteStream player started."
 # one-shot, and safe to run unconditionally: if nothing's there, this is a
 # no-op; if something is, it's stale by definition (this instance hasn't
 # decided to start multicasting yet at this point in the script).
-if pkill -f "ffmpeg.*udp://" 2>/dev/null; then
+if pkill -f "vlc.*--sout" 2>/dev/null; then
   log "Cleaned up a multicast stream orphaned by a previous run."
 fi
 
 # Graceful shutdown on `systemctl stop`/`restart` — paired with KillMode=process
 # in the systemd unit (systemd then only signals this process directly, not
-# every process in its cgroup) so shutdown goes through our own stop_vlc
-# (which also stops multicast) in order, instead of systemd blasting SIGTERM
-# at player.sh and VLC simultaneously and uncoordinated. Without this, a
-# restart (e.g. after a pushed self-update) killed VLC abruptly mid-Qt-event-
-# loop, which produced "QObject::~QObject: Timers cannot be stopped from
-# another thread" in journalctl and made restarts slow.
-trap 'log "Shutting down…"; stop_vlc; exit 0' TERM INT
+# every process in its cgroup) so shutdown goes through our own stop_vlc +
+# stop_multicast in order, instead of systemd blasting SIGTERM at player.sh
+# and VLC simultaneously and uncoordinated. Without this, a restart (e.g.
+# after a pushed self-update) killed VLC abruptly mid-Qt-event-loop, which
+# produced "QObject::~QObject: Timers cannot be stopped from another thread"
+# in journalctl and made restarts slow. Both calls listed explicitly here,
+# not just stop_vlc alone — the two are deliberately independent now (see
+# stop_vlc's own comment) so a real shutdown needs both.
+trap 'log "Shutting down…"; [ -n "$LOOP_SLEEP_PID" ] && kill "$LOOP_SLEEP_PID" 2>/dev/null; stop_vlc; stop_multicast; exit 0' TERM INT
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 while true; do
@@ -568,6 +862,7 @@ while true; do
     if [ -f "$SCREEN_IMAGE" ]; then
       SCREEN_MTIME=$(get_mtime "$SCREEN_IMAGE")
       if [ "$CURRENT_VIDEO_PATH" != "$SCREEN_IMAGE" ] || [ "$SCREEN_MTIME" != "$CURRENT_STATIC_IMAGE_MTIME" ] \
+        || [ "${HEADLESS_MODE:-}" != "$CURRENT_HEADLESS_STATE" ] \
         || { [ "${HEADLESS_MODE:-}" != "true" ] && ! kill -0 "$VLC_PID" 2>/dev/null; }; then
         log "$SCREEN_LOG_MSG"
         start_vlc "$SCREEN_IMAGE" no-multicast
@@ -575,11 +870,22 @@ while true; do
       fi
     fi
     write_status
-    sleep 30
+    # Backgrounded + wait, not a plain `sleep 30`: KillMode=process means only
+    # this script's PID gets SIGTERM, not children like sleep — and bash
+    # defers a pending trap until the current foreground command exits. A
+    # foreground sleep silently ate the TERM for up to 30s (confirmed live:
+    # exceeded TimeoutStopSec=15s and forced systemd's SIGKILL fallback).
+    # `wait` is interruptible mid-sleep, so the trap fires immediately.
+    sleep 30 &
+    LOOP_SLEEP_PID=$!
+    wait "$LOOP_SLEEP_PID"
+    LOOP_SLEEP_PID=""
     continue
   fi
 
-  WANTED=$(get_current_video)
+  CURRENT_SELECTION=$(get_current_video)
+  WANTED=$(printf '%s' "$CURRENT_SELECTION" | sed -n '1p')
+  WANTED_MULTICAST=$(printf '%s' "$CURRENT_SELECTION" | sed -n '2p')
 
   # Only meaningful once there's real scheduled content to show it over —
   # see is_disconnected's own comment for why the onboarding/idle/rescue
@@ -625,6 +931,7 @@ while true; do
     if [ -f "$IDLE_IMAGE" ]; then
       IDLE_MTIME=$(get_mtime "$IDLE_IMAGE")
       if [ "$CURRENT_VIDEO_PATH" != "$IDLE_IMAGE" ] || [ "$IDLE_MTIME" != "$CURRENT_STATIC_IMAGE_MTIME" ] \
+        || [ "${HEADLESS_MODE:-}" != "$CURRENT_HEADLESS_STATE" ] \
         || { [ "${HEADLESS_MODE:-}" != "true" ] && ! kill -0 "$VLC_PID" 2>/dev/null; }; then
         log "$IDLE_LOG_MSG"
         start_vlc "$IDLE_IMAGE" no-multicast
@@ -637,6 +944,7 @@ while true; do
       if { [ -n "$VLC_PID" ] && kill -0 "$VLC_PID" 2>/dev/null; } || { [ -n "$MULTICAST_PID" ] && kill -0 "$MULTICAST_PID" 2>/dev/null; }; then
         log "No video scheduled — stopping player."
         stop_vlc
+        stop_multicast
       fi
     fi
   elif [ ! -f "$WANTED" ]; then
@@ -655,7 +963,22 @@ while true; do
     else
       log "Content updated for currently-playing video — reloading: $WANTED"
     fi
-    start_vlc "$WANTED" "" "$OVERLAY_WANT"
+    start_vlc "$WANTED" "" "$OVERLAY_WANT" "$WANTED_MULTICAST"
+  elif [ "${HEADLESS_MODE:-}" != "$CURRENT_HEADLESS_STATE" ]; then
+    # Headless flag flipped since VLC was last (re)started — same video,
+    # nothing else changed, so no other branch here would ever notice this
+    # on its own. Confirmed live as a real gap: turning Headless on for a
+    # device that was actively playing never stopped the HDMI output already
+    # running, because every other trigger only reacts to the wanted video
+    # changing, VLC dying, etc. — not to this flag itself. start_vlc handles
+    # both directions correctly: skips the launch if now headless, or
+    # actually (re)starts it if headless just got turned off.
+    if [ "${HEADLESS_MODE:-}" = "true" ]; then
+      log "Headless mode enabled — stopping HDMI output for: $WANTED"
+    else
+      log "Headless mode disabled — resuming HDMI output for: $WANTED"
+    fi
+    start_vlc "$WANTED" "" "$OVERLAY_WANT" "$WANTED_MULTICAST"
   elif [ "${HEADLESS_MODE:-}" != "true" ] && ! kill -0 "$VLC_PID" 2>/dev/null; then
     # VLC died unexpectedly — restart it (and multicast alongside it).
     # Excluded in headless mode: VLC_PID is deliberately never set there
@@ -664,7 +987,7 @@ while true; do
     VLC_RESTART_COUNT=$((VLC_RESTART_COUNT + 1))
     log "VLC not running, restarting: $WANTED"
     signal_urgent_health
-    start_vlc "$WANTED" "" "$OVERLAY_WANT"
+    start_vlc "$WANTED" "" "$OVERLAY_WANT" "$WANTED_MULTICAST"
   elif [ "${HEADLESS_MODE:-}" != "true" ] && [ "$OVERLAY_WANT" != "$CURRENT_OVERLAY_STATE" ]; then
     # Same video, but connectivity state flipped since VLC was last started —
     # the marq flag is startup-only (no live control channel for it — see
@@ -679,13 +1002,20 @@ while true; do
     else
       log "Connectivity restored — removing on-screen indicator."
     fi
-    start_vlc "$WANTED" "" "$OVERLAY_WANT"
-  elif [ "$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT:$MULTICAST_INTERFACE" != "$CURRENT_MULTICAST_TARGET" ]; then
+    start_vlc "$WANTED" "" "$OVERLAY_WANT" "$WANTED_MULTICAST"
+  elif [ "$MULTICAST_ENABLED:$MULTICAST_ADDRESS:$MULTICAST_PORT:$MULTICAST_INTERFACE:$WANTED_MULTICAST" != "$CURRENT_MULTICAST_TARGET" ]; then
     # Was missing ":$MULTICAST_INTERFACE" on this side of the comparison —
-    # CURRENT_MULTICAST_TARGET is always stored as all FOUR fields (see
-    # start_multicast's own assignment), so this could never match as long
-    # as multicast was enabled at all, even with no config change and no
+    # CURRENT_MULTICAST_TARGET is always stored as every field
+    # start_multicast itself assigns, so this could never match as long as
+    # multicast was enabled at all, even with no config change and no
     # interface selected (the trailing ":" alone made the strings differ).
+    # :$WANTED_MULTICAST added for the same reason — an MPEG-2 transcode
+    # finishing (or a schedule swap to a different video) with everything
+    # else here unchanged must still trigger a restart, since start_multicast
+    # includes that same field in its own copy. Keep both sides of this
+    # comparison in sync field-for-field whenever either one changes — this
+    # exact drift is what silently force-restarted multicast on every single
+    # tick, forever, the first time it happened.
     # Confirmed live: this silently force-restarted the multicast process on
     # EVERY 30s main-loop tick, forever — invisible on a short test clip
     # (indistinguishable from the video's own normal loop), but very visible
@@ -700,10 +1030,10 @@ while true; do
     if [ "$MULTICAST_ENABLED" = "true" ] && [ -n "$MULTICAST_ADDRESS" ] && [ -n "$MULTICAST_PORT" ]; then
       log "Multicast config changed — restarting multicast output for: $WANTED"
     fi
-    start_multicast "$WANTED"
+    start_multicast "$WANTED_MULTICAST"
   elif [ -n "$MULTICAST_PID" ] && ! kill -0 "$MULTICAST_PID" 2>/dev/null; then
     log "Multicast output died, restarting: $WANTED"
-    start_multicast "$WANTED"
+    start_multicast "$WANTED_MULTICAST"
   elif [ "${HEADLESS_MODE:-}" = "true" ]; then
     # Steady state, headless — there's no VLC process and no HDMI display to
     # watchdog at all here (the checks below poll VLC's own HTTP interface,
@@ -754,7 +1084,7 @@ while true; do
         VLC_RESTART_COUNT=$((VLC_RESTART_COUNT + 1))
         log "VLC appears frozen or unresponsive (60s+) — restarting: $WANTED"
         signal_urgent_health
-        start_vlc "$WANTED"
+        start_vlc "$WANTED" "" "$OVERLAY_WANT" "$WANTED_MULTICAST"
       fi
     fi
   fi
@@ -768,5 +1098,10 @@ while true; do
 
   write_status
 
-  sleep 30
+  # See the other `sleep 30 & wait $!` above for why this can't be a plain
+  # sleep — same shutdown-hang risk on the service's main steady-state loop.
+  sleep 30 &
+  LOOP_SLEEP_PID=$!
+  wait "$LOOP_SLEEP_PID"
+  LOOP_SLEEP_PID=""
 done

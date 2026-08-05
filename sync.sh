@@ -358,16 +358,23 @@ MULTICAST_PORT=$(echo "$MANIFEST" | jq -r '.multicastPort // empty')
 # own SaaS traffic. Empty means "let VLC/the OS pick," same as before this
 # existed — see player.sh's start_multicast for where this is consumed.
 MULTICAST_INTERFACE=$(echo "$MANIFEST" | jq -r '.multicastInterface // empty')
+# Always a real number by the time it reaches here — the API fills in its
+# own conservative default when a device has no override set (see
+# manifest.ts's DEFAULT_MULTICAST_MAX_BITRATE_KBPS), so this is never empty
+# the way MULTICAST_ADDRESS/PORT can be. See player.sh's start_multicast for
+# where this actually gets enforced (real encode, not remux).
+MULTICAST_MAX_BITRATE_KBPS=$(echo "$MANIFEST" | jq -r '.multicastMaxBitrateKbps // 6000')
 # No HDMI display ever attached — see player.sh's own comment on HEADLESS_MODE
 # for why this exists and exactly what it skips.
 HEADLESS_MODE=$(echo "$MANIFEST" | jq -r '.headlessMode // false')
 
-grep -vE '^(MULTICAST_ENABLED|MULTICAST_ADDRESS|MULTICAST_PORT|MULTICAST_INTERFACE|HEADLESS_MODE)=' "$CONFIG" 2>/dev/null > "$CONFIG.tmp" || true
+grep -vE '^(MULTICAST_ENABLED|MULTICAST_ADDRESS|MULTICAST_PORT|MULTICAST_INTERFACE|MULTICAST_MAX_BITRATE_KBPS|HEADLESS_MODE)=' "$CONFIG" 2>/dev/null > "$CONFIG.tmp" || true
 {
   echo "MULTICAST_ENABLED=$MULTICAST_ENABLED"
   echo "MULTICAST_ADDRESS=$MULTICAST_ADDRESS"
   echo "MULTICAST_PORT=$MULTICAST_PORT"
   echo "MULTICAST_INTERFACE=$MULTICAST_INTERFACE"
+  echo "MULTICAST_MAX_BITRATE_KBPS=$MULTICAST_MAX_BITRATE_KBPS"
   echo "HEADLESS_MODE=$HEADLESS_MODE"
 } >> "$CONFIG.tmp"
 mv "$CONFIG.tmp" "$CONFIG"
@@ -534,6 +541,7 @@ apply_sync_interval "$(echo "$MANIFEST" | jq -r '.syncIntervalMinutes // 15')"
 
 # ── 2. Download missing / updated videos ──────────────────────────────────────
 NEEDED_IDS=()
+NEEDED_MULTICAST_IDS=()
 
 while IFS= read -r entry; do
   VIDEO_ID=$(echo "$entry" | jq -r '.videoId')
@@ -573,6 +581,48 @@ while IFS= read -r entry; do
       log "ERROR: Failed to download $FILENAME after retries. Keeping partial data to resume next run."
     fi
   fi
+
+  # MPEG-2 multicast variant — only present once manifest.ts finds this
+  # file's transcode READY for a multicast-enabled device (see
+  # services/multicastTranscode.ts on the API side). Absent for the vast
+  # majority of schedule entries; nothing below runs for those. Separate
+  # cache/etag files from the H.264 original above — both get downloaded and
+  # kept side by side, since a multicast device still plays the original
+  # over HDMI via VLC and only loops this variant out over multicast (see
+  # player.sh's start_vlc/start_multicast).
+  MULTICAST_DOWNLOAD_URL=$(echo "$entry" | jq -r '.multicastDownloadUrl // empty')
+  if [ -n "$MULTICAST_DOWNLOAD_URL" ]; then
+    MULTICAST_ETAG=$(echo "$entry" | jq -r '.multicastEtag // empty')
+    MULTICAST_LOCAL_PATH="$VIDEO_DIR/$VIDEO_ID-multicast.mpg"
+    NEEDED_MULTICAST_IDS+=("$VIDEO_ID")
+
+    MULTICAST_LOCAL_ETAG_FILE="$VIDEO_DIR/${VIDEO_ID}-multicast.etag"
+    MULTICAST_LOCAL_ETAG=$(cat "$MULTICAST_LOCAL_ETAG_FILE" 2>/dev/null || echo "")
+
+    if [ "$MULTICAST_LOCAL_ETAG" = "$MULTICAST_ETAG" ] && [ -f "$MULTICAST_LOCAL_PATH" ]; then
+      log "Multicast variant of $VIDEO_ID ($FILENAME) already current."
+    else
+      log "Downloading multicast variant of $FILENAME ($VIDEO_ID)…"
+      MULTICAST_TEMP_PATH="$MULTICAST_LOCAL_PATH.tmp"
+      MULTICAST_TEMP_ETAG_FILE="$MULTICAST_TEMP_PATH.etag"
+
+      if [ -f "$MULTICAST_TEMP_PATH" ] && [ "$(cat "$MULTICAST_TEMP_ETAG_FILE" 2>/dev/null)" != "$MULTICAST_ETAG" ]; then
+        rm -f "$MULTICAST_TEMP_PATH" "$MULTICAST_TEMP_ETAG_FILE"
+      fi
+      echo "$MULTICAST_ETAG" > "$MULTICAST_TEMP_ETAG_FILE"
+
+      download_with_retries "$MULTICAST_DOWNLOAD_URL" "$MULTICAST_TEMP_PATH" "$FILENAME (multicast)"
+
+      if [ "$DOWNLOAD_OK" = true ]; then
+        mv "$MULTICAST_TEMP_PATH" "$MULTICAST_LOCAL_PATH"
+        echo "$MULTICAST_ETAG" > "$MULTICAST_LOCAL_ETAG_FILE"
+        rm -f "$MULTICAST_TEMP_ETAG_FILE"
+        log "Downloaded multicast variant of $FILENAME successfully."
+      else
+        log "ERROR: Failed to download multicast variant of $FILENAME after retries. Keeping partial data to resume next run."
+      fi
+    fi
+  fi
 done < <(echo "$MANIFEST" | jq -c '.schedule[]')
 # Process substitution (< <(...)), not a here-string (<<< "$(...)") — a
 # here-string always appends a trailing newline to whatever it's given, so
@@ -594,7 +644,24 @@ for f in "$VIDEO_DIR"/*.mp4; do
   done
   if [ "$STILL_NEEDED" = false ]; then
     log "Removing obsolete video $FILE_ID"
-    rm -f "$f" "$VIDEO_DIR/${FILE_ID}.etag"
+    rm -f "$f" "$VIDEO_DIR/${FILE_ID}.etag" "$VIDEO_DIR/${FILE_ID}-multicast.mpg" "$VIDEO_DIR/${FILE_ID}-multicast.etag"
+  fi
+done
+
+# Multicast variants are cleaned up separately from the loop above — a base
+# video can still be needed (playing over HDMI) while its multicast variant
+# no longer is (multicast got disabled on this device, or the transcode
+# status regressed), so NEEDED_MULTICAST_IDS is its own, usually-smaller set.
+for f in "$VIDEO_DIR"/*-multicast.mpg; do
+  [ -f "$f" ] || continue
+  FILE_ID=$(basename "$f" -multicast.mpg)
+  STILL_NEEDED=false
+  for id in "${NEEDED_MULTICAST_IDS[@]}"; do
+    [ "$id" = "$FILE_ID" ] && STILL_NEEDED=true && break
+  done
+  if [ "$STILL_NEEDED" = false ]; then
+    log "Removing obsolete multicast variant for $FILE_ID"
+    rm -f "$f" "$VIDEO_DIR/${FILE_ID}-multicast.etag"
   fi
 done
 
@@ -613,7 +680,12 @@ echo "$MANIFEST" | jq --arg videoDir "$VIDEO_DIR" '{
     validUntil: .validUntil,
     priority: .priority,
     label: .label,
-    localPath: ($videoDir + "/" + .videoId + ".mp4")
+    localPath: ($videoDir + "/" + .videoId + ".mp4"),
+    # null for the vast majority of entries — only set when this file has a
+    # ready MPEG-2 multicast variant (see step 2 above). player.sh reads
+    # this to know what to loop out over multicast, separate from localPath
+    # above (still the H.264 original VLC plays over HDMI).
+    multicastLocalPath: (if .multicastDownloadUrl then ($videoDir + "/" + .videoId + "-multicast.mpg") else null end)
   }]
 }' > "$SCHEDULE_FILE"
 

@@ -133,6 +133,8 @@ export interface MulticastConfig {
   address: string | null
   port: number | null
   interface: string | null
+  // Null = player.sh's own fleet-wide default (6000 kbps as of writing).
+  maxBitrateKbps: number | null
 }
 
 export const systemApi = {
@@ -147,7 +149,7 @@ export const systemApi = {
   connectWifi: (data: { ssid: string; password?: string; countryCode?: string }) =>
     api.post<{ ok: boolean }>('/system/wifi/connect', data),
   networkInterfaces: () => api.get<string[]>('/system/network-interfaces'),
-  setMulticast: (data: { enabled: boolean; address?: string; port?: number; interface?: string }) =>
+  setMulticast: (data: { enabled: boolean; address?: string; port?: number; interface?: string; maxBitrateKbps?: number | null }) =>
     api.post<{ ok: boolean }>('/system/multicast', data),
   uploadFirmware: (file: File) => {
     const formData = new FormData()

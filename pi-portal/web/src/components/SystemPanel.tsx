@@ -316,7 +316,7 @@ function SettingsView() {
               <input
                 style={{ ...input, fontFamily: 'monospace' }}
                 type="number"
-                min={1}
+                min={1024}
                 max={65535}
                 value={multicastPort}
                 onChange={(e) => setMulticastPort(e.target.value)}

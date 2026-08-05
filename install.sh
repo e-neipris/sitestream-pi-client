@@ -103,7 +103,7 @@ fi
 # Node (for the standalone-mode local portal, pi-portal/) is NOT in this
 # list — handled entirely in its own section above, since which install
 # method even works depends on CPU architecture (see there for why).
-PACKAGES_TO_INSTALL="vlc jq curl cron logrotate qrencode imagemagick fonts-dejavu-core ffmpeg"
+PACKAGES_TO_INSTALL="vlc jq curl cron logrotate qrencode imagemagick fonts-dejavu-core"
 NEWLY_INSTALLED_PACKAGES=""
 for pkg in $PACKAGES_TO_INSTALL; do
   dpkg -s "$pkg" >/dev/null 2>&1 || NEWLY_INSTALLED_PACKAGES="$NEWLY_INSTALLED_PACKAGES $pkg"
@@ -326,12 +326,24 @@ rm -f "$PI_HOME/sitestream/.sync_interval"
 # one of the two can ever have it. Confirmed on real hardware: with lightdm
 # running (X11 *or* Wayland, doesn't matter which), VLC's own DRM probe fails
 # with "No plane found"; stopping lightdm and nothing else, it renders fine.
-# do_boot_behaviour B2 is "Console Autologin" — this also flips the systemd
-# default target to multi-user.target, which is why sitestream-player.service
-# below targets that instead of graphical.target (which console-autologin
-# systems never reach, so the service would just never start).
+# do_boot_behaviour B1 is plain "Console" (requires a real login, no
+# autologin) — this also flips the systemd default target to
+# multi-user.target, which is why sitestream-player.service below targets
+# that instead of graphical.target (which a non-desktop boot behavior never
+# reaches, so the service would just never start). B2 ("Console Autologin")
+# achieves the identical target flip and was used here originally, but with
+# a real physical-security cost: it leaves an already-authenticated root^Wadmin
+# shell sitting on the console permanently, with nothing covering or
+# otherwise protecting it. On a normal (non-headless) device that's at least
+# partially obscured by VLC's own fullscreen DRM output while it's running —
+# but a Headless device (see player.sh's HEADLESS_MODE) never starts VLC at
+# all, so that incidental cover is gone entirely, leaving an open shell
+# permanently exposed to anyone with physical keyboard access. Confirmed live
+# on real hardware: switching to B1 has zero effect on player.sh or any other
+# service here — none of them depend on the console actually being logged
+# into, autologin or not — while requiring a real password at the console.
 if command -v raspi-config >/dev/null 2>&1; then
-  raspi-config nonint do_boot_behaviour B2 || true
+  raspi-config nonint do_boot_behaviour B1 || true
 fi
 # The boot-behaviour change above only takes effect on next boot — belt and
 # suspenders for a re-run of this script (self-update) on a Pi that's already
