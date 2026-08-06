@@ -10,6 +10,7 @@ import authRoutes from './routes/auth'
 import systemRoutes from './routes/system'
 import { isCloudManaged } from './paths'
 import { requirePortalAuth } from './auth'
+import { startMulticastTranscodeJob } from './multicastTranscode'
 import './db' // creates the schema/tables as a side effect on first import
 
 const PORT = Number(process.env.PORT ?? 8080)
@@ -89,6 +90,12 @@ async function start() {
     app.log.error(err)
     process.exit(1)
   }
+
+  // After listen, not before — backfill/poll only touch the DB and
+  // filesystem, but starting them before the server is confirmed bound
+  // would mean a listen failure above still left a background ffmpeg job
+  // running against a process that's about to exit anyway.
+  startMulticastTranscodeJob()
 }
 
 start()

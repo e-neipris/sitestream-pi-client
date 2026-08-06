@@ -3,6 +3,7 @@ import { z } from 'zod'
 import crypto from 'crypto'
 import { schedules, videoFiles } from '../db'
 import { regenerateScheduleFile } from '../scheduleWriter'
+import { ensureMulticastTranscodeQueued } from '../multicastTranscode'
 
 const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/
 
@@ -63,6 +64,10 @@ export default async function scheduleRoutes(app: FastifyInstance) {
       priority: body.data.priority,
       label: body.data.label ?? null,
     })
+    // The normal-order case (see files.ts's own call to this for the
+    // reverse order): a file usually gets scheduled after it's already
+    // uploaded, so this is the trigger that actually fires most of the time.
+    ensureMulticastTranscodeQueued(body.data.videoFileId)
     regenerateScheduleFile()
     return reply.code(201).send(serialize(schedules.get(id)))
   })
@@ -81,6 +86,10 @@ export default async function scheduleRoutes(app: FastifyInstance) {
     }
 
     schedules.update(id, body.data)
+    // Covers a PATCH that repoints this schedule at a different (previously
+    // unscheduled) file — the file's own confirm step already tried this
+    // once, but at that time it may not have been on any schedule yet.
+    ensureMulticastTranscodeQueued(body.data.videoFileId ?? existing.video_file_id)
     regenerateScheduleFile()
     return serialize(schedules.get(id))
   })

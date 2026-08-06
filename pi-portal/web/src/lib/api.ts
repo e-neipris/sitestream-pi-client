@@ -17,6 +17,8 @@ api.interceptors.request.use((config) => {
 // copied into this project rather than imported cross-package (it has zero
 // AuthContext/tenant coupling, so a same-shaped local api.ts is all it
 // needs to run unmodified against this server instead of the cloud one).
+export type MulticastTranscodeStatus = 'NOT_NEEDED' | 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED'
+
 export interface VideoFile {
   id: string
   filename: string
@@ -26,6 +28,8 @@ export interface VideoFile {
   uploadedAt: string
   sourceZoneId: string | null
   _count?: { schedules: number }
+  multicastTranscodeStatus: MulticastTranscodeStatus
+  multicastTranscodeError: string | null
 }
 
 export const filesApi = {
@@ -133,7 +137,7 @@ export interface MulticastConfig {
   address: string | null
   port: number | null
   interface: string | null
-  // Null = player.sh's own fleet-wide default (6000 kbps as of writing).
+  // Null = player.sh's own fleet-wide default (5600 kbps as of writing).
   maxBitrateKbps: number | null
 }
 

@@ -103,7 +103,16 @@ fi
 # Node (for the standalone-mode local portal, pi-portal/) is NOT in this
 # list — handled entirely in its own section above, since which install
 # method even works depends on CPU architecture (see there for why).
-PACKAGES_TO_INSTALL="vlc jq curl cron logrotate qrencode imagemagick fonts-dejavu-core"
+# ffmpeg: back in this list after briefly being dropped when multicast
+# transcoding moved server-side (SaaS-managed devices don't need it, sync.sh
+# just downloads the cloud's already-transcoded MPEG-2 file). That dropped a
+# real case: a standalone/never-claimed device has no SaaS to transcode for
+# it at all, so pi-portal/server's own multicastTranscode.ts has to run
+# ffmpeg locally instead — needs the binary actually present to do that.
+# Installed unconditionally (not only for standalone devices) since a
+# cloud-claimed device can always be reset back to standalone later, and an
+# unused ffmpeg binary on a claimed device costs disk space, not behavior.
+PACKAGES_TO_INSTALL="vlc jq curl cron logrotate qrencode imagemagick fonts-dejavu-core ffmpeg"
 NEWLY_INSTALLED_PACKAGES=""
 for pkg in $PACKAGES_TO_INSTALL; do
   dpkg -s "$pkg" >/dev/null 2>&1 || NEWLY_INSTALLED_PACKAGES="$NEWLY_INSTALLED_PACKAGES $pkg"
@@ -166,9 +175,17 @@ if [ "$SCRIPT_DIR" != "$PI_HOME/sitestream" ]; then
   cp "$SCRIPT_DIR/sync.sh"                        "$PI_HOME/sitestream/sync.sh"
   cp "$SCRIPT_DIR/player.sh"                      "$PI_HOME/sitestream/player.sh"
   cp "$SCRIPT_DIR/listen.sh"                       "$PI_HOME/sitestream/listen.sh"
-  cp "$SCRIPT_DIR/generate-onboarding-screen.sh"  "$PI_HOME/sitestream/generate-onboarding-screen.sh"
-  cp "$SCRIPT_DIR/generate-idle-screen.sh"        "$PI_HOME/sitestream/generate-idle-screen.sh"
-  cp "$SCRIPT_DIR/generate-wifi-rescue-screen.sh" "$PI_HOME/sitestream/generate-wifi-rescue-screen.sh"
+  cp "$SCRIPT_DIR/generate-onboarding-screen.sh"     "$PI_HOME/sitestream/generate-onboarding-screen.sh"
+  cp "$SCRIPT_DIR/generate-idle-screen.sh"           "$PI_HOME/sitestream/generate-idle-screen.sh"
+  cp "$SCRIPT_DIR/generate-wifi-rescue-screen.sh"    "$PI_HOME/sitestream/generate-wifi-rescue-screen.sh"
+  # Was missing from this list entirely — harmless on a fresh install (the
+  # whole release tarball extracts straight into $PI_HOME/sitestream, so
+  # $SCRIPT_DIR already equals it and this whole block is skipped — see the
+  # comment above), but a self-update (the actual path this block exists
+  # for) would silently never deliver either of these two files to an
+  # already-deployed device, no matter how many releases shipped them.
+  cp "$SCRIPT_DIR/generate-wifi-connecting-screen.sh" "$PI_HOME/sitestream/generate-wifi-connecting-screen.sh"
+  cp "$SCRIPT_DIR/generate-no-schedule-multicast.sh"  "$PI_HOME/sitestream/generate-no-schedule-multicast.sh"
   cp "$SCRIPT_DIR/factory-reset.sh"               "$PI_HOME/sitestream/factory-reset.sh"
   cp "$SCRIPT_DIR/forget-wifi.sh"                 "$PI_HOME/sitestream/forget-wifi.sh"
   cp "$SCRIPT_DIR/wifi-ap-fallback.sh"            "$PI_HOME/sitestream/wifi-ap-fallback.sh"
@@ -180,6 +197,8 @@ chmod +x "$PI_HOME/sitestream/listen.sh"
 chmod +x "$PI_HOME/sitestream/generate-onboarding-screen.sh"
 chmod +x "$PI_HOME/sitestream/generate-idle-screen.sh"
 chmod +x "$PI_HOME/sitestream/generate-wifi-rescue-screen.sh"
+chmod +x "$PI_HOME/sitestream/generate-wifi-connecting-screen.sh"
+chmod +x "$PI_HOME/sitestream/generate-no-schedule-multicast.sh"
 chmod +x "$PI_HOME/sitestream/factory-reset.sh"
 chmod +x "$PI_HOME/sitestream/forget-wifi.sh"
 chmod +x "$PI_HOME/sitestream/wifi-ap-fallback.sh"
@@ -543,12 +562,24 @@ fi
 # pi-portal/server for the full design). Goes read-only on its own once
 # DEVICE_TOKEN shows up in config.env (i.e. this device gets claimed into
 # the cloud after all) — no coordination needed here.
+#
+# After=network.target, deliberately NOT network-online.target — this is a
+# local HTTP server binding to a local interface, which only needs the
+# network stack initialized, not an actual working connection. Confirmed
+# live this is exactly the gap that made a fresh, never-configured device's
+# "Joining <SSID>…" screen (see generate-wifi-connecting-screen.sh) appear
+# to go missing: network-online.target can take up to 60s to resolve on a
+# device with no saved profile yet (NetworkManager-wait-online.service's own
+# NM_ONLINE_TIMEOUT), while the setup hotspot itself (sitestream-wifi-ap.
+# service, only needs NetworkManager.service) comes up within a few seconds
+# — so an installer could reach the hotspot and try the portal before this
+# service had actually started listening, with nothing to indicate why the
+# page wasn't loading yet.
 if [ -d "$PI_HOME/sitestream/pi-portal" ]; then
   cat > /etc/systemd/system/sitestream-portal.service << EOF
 [Unit]
 Description=SiteStream Standalone-Mode Local Portal
-After=network-online.target
-Wants=network-online.target
+After=network.target
 
 [Service]
 User=$PI_USER
@@ -603,6 +634,14 @@ TIMEDATECTL_BIN="$(command -v timedatectl)"
 HOSTNAMECTL_BIN="$(command -v hostnamectl)"
 IW_BIN_FOR_SUDOERS="$(command -v iw)"
 NMCLI_BIN="$(command -v nmcli)"
+# For start_multicast's own tc qdisc call (see player.sh) — confirmed live
+# (manual testing against real SMARTBOX hardware) that VLC's cold-start
+# burst overwhelms the receiver's ingest hardware at a timescale finer than
+# packet-capture analysis at 50ms granularity could resolve, even though the
+# sustained bitrate stayed well within budget. A kernel-level token-bucket
+# queueing discipline on the interface caps any burst regardless of how VLC
+# paces its own output, closing a gap an application-side fix can't.
+TC_BIN="$(command -v tc)"
 cat > /etc/sudoers.d/sitestream << EOF
 $PI_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart sitestream-player.service
 $PI_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart sitestream-listen.service
@@ -621,6 +660,7 @@ $PI_USER ALL=(root) NOPASSWD: $NMCLI_BIN connection delete *
 $PI_USER ALL=(root) NOPASSWD: $NMCLI_BIN connection up *
 $PI_USER ALL=(root) NOPASSWD: $NMCLI_BIN connection modify *
 $PI_USER ALL=(root) NOPASSWD: $NMCLI_BIN radio wifi on
+$PI_USER ALL=(root) NOPASSWD: $TC_BIN qdisc replace dev * root tbf rate * burst 32kb latency 250ms
 EOF
 chmod 440 /etc/sudoers.d/sitestream
 if ! visudo -c -f /etc/sudoers.d/sitestream >/dev/null 2>&1; then

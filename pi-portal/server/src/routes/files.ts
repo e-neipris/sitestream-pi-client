@@ -6,6 +6,7 @@ import path from 'path'
 import { videoFiles } from '../db'
 import { VIDEO_DIR } from '../paths'
 import { regenerateScheduleFile } from '../scheduleWriter'
+import { ensureMulticastTranscodeQueued } from '../multicastTranscode'
 
 const initiateUploadSchema = z.object({
   filename: z.string().min(1),
@@ -33,6 +34,8 @@ function serialize(row: ReturnType<typeof videoFiles.get>) {
     uploadedAt: row.uploaded_at,
     sourceZoneId: null,
     _count: { schedules: videoFiles.scheduleCount(row.id) },
+    multicastTranscodeStatus: row.multicast_transcode_status,
+    multicastTranscodeError: row.multicast_transcode_error,
   }
 }
 
@@ -111,6 +114,12 @@ export default async function fileRoutes(app: FastifyInstance) {
     if (!existing) return reply.code(404).send({ error: 'Not found' })
 
     videoFiles.confirmEtag(id, body.data.etag.replace(/"/g, ''))
+    // Speculative — only actually queues if this device has multicast on
+    // AND this file is already on the schedule (the far less common order:
+    // usually a file gets scheduled after it's uploaded, not before — see
+    // schedules.ts's own call to this for the normal case). Harmless no-op
+    // otherwise.
+    ensureMulticastTranscodeQueued(id)
     regenerateScheduleFile()
     return serialize(videoFiles.get(id))
   })
@@ -126,6 +135,12 @@ export default async function fileRoutes(app: FastifyInstance) {
     videoFiles.delete(id)
     const videoPath = path.join(VIDEO_DIR, `${id}.mp4`)
     fs.rmSync(videoPath, { force: true })
+    // Multicast variant (if this file was ever transcoded) and any
+    // in-progress .tmp from a transcode that was killed mid-write — same
+    // cleanup sync.sh's own obsolete-video sweep does for the cloud-driven
+    // path.
+    fs.rmSync(path.join(VIDEO_DIR, `${id}-multicast.mpg`), { force: true })
+    fs.rmSync(path.join(VIDEO_DIR, `${id}-multicast.mpg.tmp`), { force: true })
     regenerateScheduleFile()
     return reply.code(204).send()
   })

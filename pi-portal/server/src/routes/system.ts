@@ -6,6 +6,7 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import { SITESTREAM_DIR, CONFIG_FILE, getApiUrl, getAppUrl, parseConfigEnv } from '../paths'
+import { ensureAllScheduledTranscodesQueued } from '../multicastTranscode'
 
 const exec = promisify(execCb)
 const execFile = promisify(execFileCb)
@@ -204,7 +205,7 @@ export interface MulticastConfig {
   address: string | null
   port: number | null
   interface: string | null
-  // Null = player.sh's own fleet-wide default (6000 kbps) applies — see its
+  // Null = player.sh's own fleet-wide default (5600 kbps) applies — see its
   // start_multicast. Kept optional here rather than forced to a concrete
   // number so a standalone device's config.env stays consistent with a
   // cloud-claimed one that's never had this explicitly set either.
@@ -671,6 +672,14 @@ export default async function systemRoutes(app: FastifyInstance) {
         interface: body.data.interface ?? null,
         maxBitrateKbps: body.data.maxBitrateKbps ?? null,
       })
+      // Config is written (and re-read fresh by ensureMulticastTranscodeQueued
+      // via parseConfigEnv) before this runs, so it sees the just-saved
+      // enabled state, not the previous one. No harm calling this on every
+      // save with enabled=true rather than only on an off->on transition —
+      // it only ever queues a file that isn't already queued/done, so a
+      // redundant call (address/port changed but was already enabled) is a
+      // cheap no-op.
+      if (body.data.enabled) ensureAllScheduledTranscodesQueued()
       return { ok: true }
     } catch (err) {
       logExecFailure(request.log, 'POST /multicast', err)

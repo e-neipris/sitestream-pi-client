@@ -44,6 +44,14 @@ export default function MediaPanel({ context }: Props) {
   const { data: files, isLoading } = useQuery({
     queryKey: ['files', { tenantId: context?.tenantId }],
     queryFn: () => filesApi.list(context?.tenantId).then(r => r.data),
+    // Poll while any file has a transcode in flight, so "Transcoding for
+    // multicast..." resolves to Ready/Failed on its own instead of needing a
+    // manual page refresh — stops polling once nothing is actually pending.
+    refetchInterval: (query) => {
+      const data = query.state.data as VideoFile[] | undefined
+      const hasInFlight = data?.some(f => f.multicastTranscodeStatus === 'PENDING' || f.multicastTranscodeStatus === 'PROCESSING')
+      return hasInFlight ? 10_000 : false
+    },
   })
 
   const displayedFiles = useMemo(() => {
@@ -188,6 +196,7 @@ export default function MediaPanel({ context }: Props) {
                 <div style={{ color: '#475569', fontSize: 11, fontFamily: 'monospace', marginTop: 2 }}>
                   {f.etag || <span style={{ color: '#f59e0b' }}>Pending confirmation</span>}
                 </div>
+                <MulticastTranscodeBadge file={f} />
               </td>
               <td style={td}><span style={mutedText}>{formatBytes(f.sizeBytes)}</span></td>
               <td style={td}>
@@ -219,6 +228,31 @@ export default function MediaPanel({ context }: Props) {
             : 'No videos uploaded yet.'}
         </p>
       )}
+    </div>
+  )
+}
+
+/**
+ * Only rendered once a file's multicastTranscodeStatus leaves NOT_NEEDED
+ * (the default for the vast majority of files, which never touch a
+ * multicast-enabled device) — silent until it's actually relevant.
+ */
+function MulticastTranscodeBadge({ file }: { file: VideoFile }) {
+  if (file.multicastTranscodeStatus === 'NOT_NEEDED') return null
+
+  const { label, color } = {
+    PENDING: { label: 'Queued for multicast transcode', color: '#94a3b8' },
+    PROCESSING: { label: 'Transcoding for multicast — this can take a few minutes', color: '#0ea5e9' },
+    READY: { label: 'Multicast-ready (MPEG-2)', color: '#22c55e' },
+    FAILED: { label: 'Multicast transcode failed', color: '#f87171' },
+  }[file.multicastTranscodeStatus]
+
+  return (
+    <div
+      style={{ color, fontSize: 11, marginTop: 2 }}
+      title={file.multicastTranscodeStatus === 'FAILED' ? (file.multicastTranscodeError ?? undefined) : undefined}
+    >
+      {label}
     </div>
   )
 }

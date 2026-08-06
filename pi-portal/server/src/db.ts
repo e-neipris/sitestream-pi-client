@@ -14,7 +14,31 @@ db.exec(`
     duration_seconds INTEGER,
     uploaded_at TEXT NOT NULL,
     version INTEGER NOT NULL DEFAULT 1
-  );
+  );`)
+
+// Added after video_files already shipped on real devices — CREATE TABLE IF
+// NOT EXISTS above is a no-op against an existing table, so these three
+// columns need their own guarded ALTER TABLE instead, or an already-deployed
+// device's pi-portal.sqlite3 would never pick them up on self-update.
+// Mirrors the SaaS API's own multicastTranscodeStatus/multicastTranscodeError
+// (see packages/api's Prisma schema + multicastTranscode.ts) — same status
+// values (NOT_NEEDED/PENDING/PROCESSING/READY/FAILED), same meaning, just
+// tracking a local file on disk instead of an S3 key/etag since standalone
+// mode has no S3 to point at.
+const videoFileColumns = new Set(
+  (db.prepare("PRAGMA table_info(video_files)").all() as { name: string }[]).map((c) => c.name),
+)
+if (!videoFileColumns.has('multicast_transcode_status')) {
+  db.exec("ALTER TABLE video_files ADD COLUMN multicast_transcode_status TEXT NOT NULL DEFAULT 'NOT_NEEDED'")
+}
+if (!videoFileColumns.has('multicast_transcoded_at')) {
+  db.exec('ALTER TABLE video_files ADD COLUMN multicast_transcoded_at TEXT')
+}
+if (!videoFileColumns.has('multicast_transcode_error')) {
+  db.exec('ALTER TABLE video_files ADD COLUMN multicast_transcode_error TEXT')
+}
+
+db.exec(`
 
   CREATE TABLE IF NOT EXISTS schedules (
     id TEXT PRIMARY KEY,
@@ -43,6 +67,8 @@ db.exec(`
   );
 `)
 
+export type MulticastTranscodeStatus = 'NOT_NEEDED' | 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED'
+
 export interface VideoFileRow {
   id: string
   filename: string
@@ -51,6 +77,9 @@ export interface VideoFileRow {
   duration_seconds: number | null
   uploaded_at: string
   version: number
+  multicast_transcode_status: MulticastTranscodeStatus
+  multicast_transcoded_at: string | null
+  multicast_transcode_error: string | null
 }
 
 export interface ScheduleRow {
@@ -75,11 +104,18 @@ export const videoFiles = {
     db.prepare('SELECT * FROM video_files WHERE filename = ?').get(filename) as VideoFileRow | undefined,
   upsert: (row: { id: string; filename: string; sizeBytes: number; durationSeconds?: number; version: number }): void => {
     db.prepare(`
-      INSERT INTO video_files (id, filename, size_bytes, etag, duration_seconds, uploaded_at, version)
-      VALUES (@id, @filename, @sizeBytes, '', @durationSeconds, @uploadedAt, @version)
+      INSERT INTO video_files (id, filename, size_bytes, etag, duration_seconds, uploaded_at, version, multicast_transcode_status, multicast_transcoded_at, multicast_transcode_error)
+      VALUES (@id, @filename, @sizeBytes, '', @durationSeconds, @uploadedAt, @version, 'NOT_NEEDED', NULL, NULL)
       ON CONFLICT(id) DO UPDATE SET
         filename = @filename, size_bytes = @sizeBytes, etag = '', duration_seconds = @durationSeconds,
-        uploaded_at = @uploadedAt, version = @version
+        uploaded_at = @uploadedAt, version = @version,
+        -- A replace-in-place (same id, bumped version — see files.ts's
+        -- initiate-upload) means the bytes behind this id changed, so any
+        -- previous transcode is now for the WRONG content. Reset to
+        -- NOT_NEEDED rather than leaving a stale READY/FAILED status —
+        -- ensureMulticastTranscodeQueued (called after the new upload's own
+        -- confirm) re-queues it if still needed, same as a brand-new file.
+        multicast_transcode_status = 'NOT_NEEDED', multicast_transcoded_at = NULL, multicast_transcode_error = NULL
     `).run({
       id: row.id, filename: row.filename, sizeBytes: row.sizeBytes,
       durationSeconds: row.durationSeconds ?? null, uploadedAt: new Date().toISOString(), version: row.version,
@@ -91,6 +127,42 @@ export const videoFiles = {
   delete: (id: string): void => {
     db.prepare('DELETE FROM video_files WHERE id = ?').run(id)
   },
+  // Skips PENDING/PROCESSING/READY (already queued, in flight, or done) —
+  // callers are expected to check status before calling this, same
+  // no-clobber intent as the SaaS's own ensureMulticastTranscodeQueued, kept
+  // here too as a second guard against a caller getting that wrong.
+  setMulticastPending: (id: string): void => {
+    db.prepare(`
+      UPDATE video_files SET multicast_transcode_status = 'PENDING', multicast_transcode_error = NULL
+      WHERE id = ? AND multicast_transcode_status NOT IN ('PENDING', 'PROCESSING', 'READY')
+    `).run(id)
+  },
+  // Race-safe claim, same pattern as the SaaS's updateMany claim in
+  // runNextMulticastTranscode: only actually claims (returns true) if this
+  // row was still PENDING at the moment of the UPDATE, so two overlapping
+  // poll ticks can never both start transcoding the same file.
+  claimMulticastPending: (id: string): boolean => {
+    const result = db.prepare(`
+      UPDATE video_files SET multicast_transcode_status = 'PROCESSING'
+      WHERE id = ? AND multicast_transcode_status = 'PENDING'
+    `).run(id)
+    return result.changes > 0
+  },
+  setMulticastReady: (id: string): void => {
+    db.prepare(`
+      UPDATE video_files SET multicast_transcode_status = 'READY', multicast_transcoded_at = ?, multicast_transcode_error = NULL
+      WHERE id = ?
+    `).run(new Date().toISOString(), id)
+  },
+  setMulticastFailed: (id: string, error: string): void => {
+    db.prepare(`
+      UPDATE video_files SET multicast_transcode_status = 'FAILED', multicast_transcode_error = ?
+      WHERE id = ?
+    `).run(error.slice(0, 2000), id)
+  },
+  findNextPendingMulticast: (): VideoFileRow | undefined =>
+    db.prepare("SELECT * FROM video_files WHERE multicast_transcode_status = 'PENDING' ORDER BY uploaded_at ASC LIMIT 1")
+      .get() as VideoFileRow | undefined,
   scheduleCount: (id: string): number =>
     (db.prepare('SELECT COUNT(*) as c FROM schedules WHERE video_file_id = ?').get(id) as { c: number }).c,
 }

@@ -355,7 +355,19 @@ swap_multicast_video() {
     local playlist_rc=$?
     log "DEBUG swap: attempt=$attempt playlist_rc=$playlist_rc playlist_response=[$playlist_response]" >&2
     if [ "$playlist_rc" -eq 0 ]; then
-      new_plid=$(printf '%s' "$playlist_response" | grep -F "$new_filename" | sed -nE 's/^\| *\*?([0-9]+).*/\1/p' | head -1)
+      # Only ever trust the line VLC itself marks as currently playing (*),
+      # not just any line containing the filename. Confirmed live: matching
+      # on filename alone breaks the moment the same video gets swapped in
+      # more than once (completely normal for real scheduling — alternating
+      # between two videos through the day) — a stale leftover entry from an
+      # earlier swap has the exact same filename, and `head -1` could just
+      # as easily grab that dead entry's id as the real new one. When that
+      # happens, CURRENT_MULTICAST_PLID gets set to the wrong id, its delete
+      # below never removes the real old item, and orphaned entries pile up
+      # in the playlist forever — which --loop eventually wraps around into,
+      # undoing the swap. The `*` marker is unambiguous regardless of how
+      # many stale same-named entries are already sitting in the playlist.
+      new_plid=$(printf '%s' "$playlist_response" | grep -E '^\| *\*[0-9]+' | grep -F "$new_filename" | sed -nE 's/^\| *\*([0-9]+).*/\1/p' | head -1)
       [ -n "$new_plid" ] && break
     fi
     sleep 0.3
@@ -364,12 +376,21 @@ swap_multicast_video() {
     return 1
   fi
 
-  # Old item may not exist yet (very first swap after a fresh process start
-  # — see start_multicast, where CURRENT_MULTICAST_PLID gets discovered the
-  # same way right after launch) — nothing to delete in that case.
-  if [ -n "$CURRENT_MULTICAST_PLID" ]; then
-    send_multicast_rc "delete $CURRENT_MULTICAST_PLID" >/dev/null || true
-  fi
+  # Delete every OTHER item in the playlist, not just the single previously-
+  # tracked CURRENT_MULTICAST_PLID — self-heals any stale leftovers from an
+  # earlier swap whose own delete silently failed (or, before the `*`-marker
+  # fix above, from new_plid itself having been wrong), instead of letting
+  # them silently compound across every future swap. Filtered to lines
+  # containing ".mpg" — our multicast files are always named
+  # "*-multicast.mpg" — so this only ever matches real playlist entries,
+  # never the "Playlist"/"Media Library" root nodes RC's listing also
+  # includes (those have no file extension in their own text).
+  local old_plids
+  old_plids=$(printf '%s' "$playlist_response" | grep -F '.mpg' | sed -nE 's/^\| *\*?([0-9]+) - .*/\1/p' | grep -v "^${new_plid}\$")
+  local old_plid
+  for old_plid in $old_plids; do
+    send_multicast_rc "delete $old_plid" >/dev/null || true
+  done
 
   CURRENT_MULTICAST_PLID="$new_plid"
   echo ok
@@ -456,6 +477,40 @@ start_multicast() {
   MIFACE_ARGS=()
   if [ -n "$MULTICAST_INTERFACE" ]; then
     MIFACE_ARGS=(--miface "$MULTICAST_INTERFACE")
+  fi
+
+  # Confirmed live (manual testing against real SMARTBOX hardware) that a
+  # cold start's burst — invisible as a sustained-average bitrate problem in
+  # packet-capture analysis at 50ms granularity, but real at a finer
+  # timescale than that could resolve — overwhelms the receiver's ingest
+  # hardware and locks it up until power-cycled. A kernel-level token-bucket
+  # queueing discipline on the outgoing interface caps any burst regardless
+  # of how VLC internally paces its own output, closing a gap a purely
+  # application-side fix can't. `replace`, not `add`: safe to re-run every
+  # time this function reaches a cold start (idempotent — a second
+  # application just re-asserts the same rule), so this is always in place
+  # before a cold start can happen, including the very first one after boot,
+  # without needing separate one-time setup plumbing anywhere else.
+  # rate: MULTICAST_MAX_BITRATE_KBPS if set (see sync.sh/pi-portal's own
+  # comments on that field), else 5600 — the exact value confirmed live to
+  # let SMARTBOX recover reliably, deliberately a little under the encode's
+  # own 6000k maxrate so the cap actually bites instead of never engaging.
+  # burst/latency are TBF tuning constants, not per-device config — 32kb is
+  # roughly one video frame's worth of data at this bitrate (how much can
+  # leave in a single instantaneous burst before throttling kicks in); 250ms
+  # latency is how long TBF may hold a packet queued before dropping it
+  # rather than delaying it further. Interface matches whatever
+  # MULTICAST_INTERFACE/--miface above is already sending on, not
+  # necessarily eth0 — defaults to eth0 only when that's unset, same
+  # fallback the OS itself would otherwise pick.
+  local tc_rate_kbit="${MULTICAST_MAX_BITRATE_KBPS:-5600}"
+  local tc_iface="${MULTICAST_INTERFACE:-eth0}"
+  if command -v tc >/dev/null 2>&1; then
+    sudo tc qdisc replace dev "$tc_iface" root tbf rate "${tc_rate_kbit}kbit" burst 32kb latency 250ms \
+      >>"$SITESTREAM_DIR/logs/vlc-multicast.log" 2>&1 \
+      || log "WARN: failed to apply tc rate-limit on $tc_iface — cold-start bitrate burst protection not active this launch."
+  else
+    log "WARN: tc not installed — cold-start bitrate burst protection not active. Re-run install.sh to pick it up."
   fi
 
   log "Starting multicast output: udp://$MULTICAST_ADDRESS:$MULTICAST_PORT${MULTICAST_INTERFACE:+ via $MULTICAST_INTERFACE} ($multicast_video_path)"
@@ -764,11 +819,35 @@ get_current_video() {
   local now_date
   now_date=$(date '+%Y-%m-%dT00:00:00.000Z')
 
-  # Use jq to find the highest-priority schedule entry active right now
+  # Use jq to find the highest-priority schedule entry active right now.
+  #
+  # .endTime >= $now, NOT >: confirmed live as the actual root cause of two
+  # SMARTBOX-feeding devices restarting VLC at fixed times every day (00:00
+  # and 06:00) — a schedule entry ending at "23:59" (the standard "all day"
+  # pattern: startTime 00:00, endTime 23:59) stopped matching the instant
+  # the clock read "23:59" under a strict >, since now_hhmm is minute-
+  # granularity (date +%H:%M, no seconds) — "23:59" > "23:59" is false —
+  # leaving the entire 23:59 minute with nothing scheduled at all, every
+  # single day, for what is likely the most common schedule shape in the
+  # product. That "nothing scheduled" state is what triggers start_vlc's own
+  # no-multicast path to stop the multicast process outright (see its own
+  # comment) — so the following minute's video reappearing forces a full
+  # cold-start restart instead of a live swap, right at the schedule
+  # boundary. Measured live via packet capture: a full restart on this
+  # hardware produces an ~9s (up to ~30s+ worst case, bounded by this same
+  # loop's own poll interval) complete gap in multicast output — long enough
+  # to lock up SMARTBOX's receiver and require a manual power-cycle to
+  # recover, which is the actual production symptom this was chasing.
+  # >= does allow two back-to-back entries sharing an exact boundary (one
+  # ending "12:00", the next starting "12:00") to both match for that one
+  # minute — resolved the same way any other priority tie already is (see
+  # sort_by priority below); a strictly smaller, more benign edge case than
+  # guaranteeing a real gap once every 24 hours for the single most common
+  # schedule pattern there is.
   jq -r --arg now "$now_hhmm" --argjson dow "$now_dow" --arg today "$now_date" '
     .schedule
     | map(select(
-        (.startTime <= $now) and (.endTime > $now)
+        (.startTime <= $now) and (.endTime >= $now)
         and ((.daysOfWeek | length) == 0 or (.daysOfWeek[] | . == $dow) )
         and ((.validFrom == null) or (.validFrom <= $today))
         and ((.validUntil == null) or (.validUntil >= $today))
@@ -887,6 +966,24 @@ while true; do
   WANTED=$(printf '%s' "$CURRENT_SELECTION" | sed -n '1p')
   WANTED_MULTICAST=$(printf '%s' "$CURRENT_SELECTION" | sed -n '2p')
 
+  # Nothing real scheduled (or scheduled but not transcoded for multicast
+  # yet) with multicast actually enabled — fall back to the "No Scheduled
+  # Content" placeholder (see generate-no-schedule-multicast.sh) instead of
+  # leaving WANTED_MULTICAST empty. Paired with the idle branch below no
+  # longer stopping multicast outright: the process now always has SOME
+  # video to broadcast whenever it's enabled at all, so every transition —
+  # including into and out of "nothing scheduled" — goes through the same
+  # live RC swap real content changes already use, never a cold restart.
+  # Confirmed live this matters: a full restart measured ~9-30s of complete
+  # multicast silence, long enough to lock up SMARTBOX's receiver and
+  # require a manual power-cycle to recover. Only generated/substituted when
+  # actually needed — a claimed device with real content scheduled, or any
+  # device with multicast off, never touches this.
+  if [ -z "$WANTED_MULTICAST" ] && [ "${MULTICAST_ENABLED:-}" = "true" ]; then
+    "$SITESTREAM_DIR/generate-no-schedule-multicast.sh" 2>>"$SITESTREAM_DIR/logs/vlc.log" || true
+    [ -f "$SITESTREAM_DIR/no-schedule-multicast.mpg" ] && WANTED_MULTICAST="$SITESTREAM_DIR/no-schedule-multicast.mpg"
+  fi
+
   # Only meaningful once there's real scheduled content to show it over —
   # see is_disconnected's own comment for why the onboarding/idle/rescue
   # screens below are excluded.
@@ -934,7 +1031,13 @@ while true; do
         || [ "${HEADLESS_MODE:-}" != "$CURRENT_HEADLESS_STATE" ] \
         || { [ "${HEADLESS_MODE:-}" != "true" ] && ! kill -0 "$VLC_PID" 2>/dev/null; }; then
         log "$IDLE_LOG_MSG"
-        start_vlc "$IDLE_IMAGE" no-multicast
+        # NOT "no-multicast" — WANTED_MULTICAST already resolved to the
+        # no-schedule placeholder above when multicast is enabled, so this
+        # takes the normal path and start_vlc's own call to start_multicast
+        # keeps the stream alive (live-swapping into the placeholder if
+        # something was already broadcasting) instead of stopping it. See
+        # this loop's own comment on WANTED_MULTICAST for why.
+        start_vlc "$IDLE_IMAGE" "" "" "$WANTED_MULTICAST"
         CURRENT_STATIC_IMAGE_MTIME="$IDLE_MTIME"
       fi
     else
@@ -1094,6 +1197,29 @@ while true; do
     rm -f "$SITESTREAM_DIR/.schedule_updated"
     log "Schedule updated — re-evaluating."
     # Force re-evaluation next loop without waiting
+  fi
+
+  # Multicast playback-state watchdog — independent of the whole if/elif
+  # chain above (checked every tick, regardless of which branch fired this
+  # time around), because the failure it catches isn't tied to any one of
+  # them. Confirmed live: VLC's own --loop can leave a freshly swapped-in
+  # video (see swap_multicast_video) STOPPED after its first playthrough
+  # finishes, instead of correctly restarting it — reproduced specifically
+  # when the new video is short enough that its first natural loop boundary
+  # lands close to when the swap's own add+delete RC sequence is still
+  # settling, but not on later loops once things have settled (a plain RC
+  # `play` resumes it instantly and it then loops correctly on its own from
+  # there). The multicast process stays alive throughout (passes kill -0)
+  # and the video is still correctly loaded, so nothing else here notices —
+  # the stream just goes silent until something explicitly tells VLC to play
+  # again. Cheap to check every tick: one RC round-trip, and `play` against
+  # an already-playing stream is a harmless no-op.
+  if [ -n "$MULTICAST_PID" ] && kill -0 "$MULTICAST_PID" 2>/dev/null; then
+    MULTICAST_STATUS=$(send_multicast_rc "status")
+    if ! printf '%s' "$MULTICAST_STATUS" | grep -q "state playing"; then
+      log "WARN: multicast output not playing (state check) — resuming."
+      send_multicast_rc "play" >/dev/null
+    fi
   fi
 
   write_status
